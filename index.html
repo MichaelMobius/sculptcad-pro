@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#070914" />
+  <title>SculptCAD Pro — modelado y escultura 3D</title>
+  <link rel="icon" type="image/png" sizes="32x32" href="src/assets/favicon-32.png" />
+  <link rel="apple-touch-icon" sizes="180x180" href="src/assets/icon-180.png" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="stylesheet" href="src/styles.css" />
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.164.1/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.164.1/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="startupSplash" class="startup-splash" aria-hidden="true">
+    <div class="startup-card">
+      <img class="startup-logo" src="src/assets/logo-sculptcad-pro.png" alt="SculptCAD Pro" />
+      <p class="startup-tag">Modela, esculpe, pinta y exporta piezas 3D</p>
+      <div class="startup-loader"><span></span><span></span><span></span></div>
+      <small>Inicializando entorno de trabajo…</small>
+    </div>
+  </div>
+
+  <div id="app">
+    <header class="topbar">
+      <div class="brand">
+        <img class="brand-logo" src="src/assets/logo-sculptcad-pro.png" alt="SculptCAD Pro" />
+      </div>
+
+      <nav class="top-actions" aria-label="Acciones del proyecto">
+        <button id="newSceneBtn" title="Crear una escena nueva">Nuevo</button>
+        <label class="file-btn" title="Importar OBJ, STL, GLTF o GLB">
+          Importar
+          <input id="modelInput" type="file" accept=".obj,.stl,.gltf,.glb" hidden />
+        </label>
+        <button id="saveLocalTopBtn" title="Guardar una copia en este navegador">Guardar copia</button>
+        <details class="export-menu">
+          <summary>Exportar</summary>
+          <div class="export-popover">
+            <div class="export-brand">
+              <img src="src/assets/icon-192.png" alt="" aria-hidden="true" />
+              <div>
+                <strong>Exportar proyecto</strong>
+                <span>Elige el formato según tu flujo de trabajo</span>
+              </div>
+            </div>
+            <button id="exportGlbBtn"><strong>GLB</strong><span>Conserva material y textura</span></button>
+            <button id="exportStlSelectedQuickBtn"><strong>STL seleccionado</strong><span>Para impresión 3D</span></button>
+            <button id="exportStlSceneQuickBtn"><strong>STL de escena</strong><span>Todos los objetos visibles</span></button>
+            <button id="exportObjBtn"><strong>OBJ</strong><span>Geometría editable</span></button>
+            <button id="saveTextureBtn"><strong>Textura PNG</strong><span>Mapa del objeto seleccionado</span></button>
+          </div>
+        </details>
+        <button id="helpBtn" class="icon-button" title="Ayuda y atajos" aria-label="Abrir ayuda">?</button>
+      </nav>
+    </header>
+
+    <aside class="toolbar" aria-label="Herramientas principales">
+      <button class="tool active" data-tool="select" title="Seleccionar (V)" aria-pressed="true"><b>↖</b><span>Seleccionar</span><kbd>V</kbd></button>
+      <button class="tool" data-tool="move" title="Mover (W)" aria-pressed="false"><b>↔</b><span>Mover</span><kbd>W</kbd></button>
+      <button class="tool" data-tool="rotate" title="Rotar (E)" aria-pressed="false"><b>⟳</b><span>Rotar</span><kbd>E</kbd></button>
+      <button class="tool" data-tool="scale" title="Escalar (R)" aria-pressed="false"><b>⤢</b><span>Escalar</span><kbd>R</kbd></button>
+      <button class="tool" data-tool="sculpt" title="Esculpir (B)" aria-pressed="false"><b>●</b><span>Esculpir</span><kbd>B</kbd></button>
+      <button class="tool" data-tool="paint" title="Pintar textura (P)" aria-pressed="false"><b>✎</b><span>Pintar</span><kbd>P</kbd></button>
+      <button class="tool" data-tool="measure" title="Medir (M)" aria-pressed="false"><b>⌖</b><span>Medir</span><kbd>M</kbd></button>
+    </aside>
+
+    <main id="viewport">
+      <canvas id="sceneCanvas"></canvas>
+      <div id="brushPreview"></div>
+
+      <nav class="workflow-rail" role="tablist" aria-label="Flujo de trabajo móvil">
+        <button role="tab" aria-selected="true" class="workflow-step active" data-workspace-btn="model"><span>1</span>Modelar</button>
+        <button role="tab" aria-selected="false" class="workflow-step" data-workspace-btn="sculpt"><span>2</span>Esculpir</button>
+        <button role="tab" aria-selected="false" class="workflow-step" data-workspace-btn="paint"><span>3</span>Pintar</button>
+        <button role="tab" aria-selected="false" class="workflow-step" data-workspace-btn="export"><span>4</span>Exportar</button>
+      </nav>
+
+      <section class="context-card" aria-live="polite">
+        <div class="context-icon" id="activeToolIcon">↖</div>
+        <div>
+          <strong id="activeToolName">Seleccionar</strong>
+          <p id="workspaceHint">Elige un objeto o agrega una forma para comenzar.</p>
+        </div>
+      </section>
+
+      <div class="hud">
+        <div id="hudPrimary"><strong>Clic izquierdo:</strong> seleccionar</div>
+        <div id="hudSecondary"><strong>Clic derecho:</strong> orbitar · <strong>rueda:</strong> zoom</div>
+      </div>
+      <div id="status" class="status" role="status">Listo</div>
+    </main>
+
+    <button id="inspectorToggle" class="inspector-toggle" aria-expanded="true" title="Ocultar panel derecho">Ocultar panel</button>
+
+    <aside class="inspector" aria-label="Panel de propiedades">
+      <div class="workspace-tabs" role="tablist" aria-label="Etapas de trabajo">
+        <button role="tab" aria-selected="true" class="active" data-workspace-btn="model">Modelar</button>
+        <button role="tab" aria-selected="false" data-workspace-btn="sculpt">Esculpir</button>
+        <button role="tab" aria-selected="false" data-workspace-btn="paint">Pintar</button>
+        <button role="tab" aria-selected="false" data-workspace-btn="export">Exportar</button>
+      </div>
+
+      <section class="selection-card" data-workspaces="all">
+        <div>
+          <span>Selección actual</span>
+          <strong id="selectionSummary">Sin objeto</strong>
+        </div>
+        <button id="focusQuickBtn" title="Enfocar el objeto seleccionado">Enfocar</button>
+      </section>
+
+      <div class="history-strip" data-workspaces="all" role="group" aria-label="Historial de cambios">
+        <button id="undoBtn" title="Deshacer (Ctrl+Z)"><span aria-hidden="true">↶</span> Deshacer</button>
+        <button id="redoBtn" title="Rehacer (Ctrl+Y o Ctrl+Shift+Z)"><span aria-hidden="true">↷</span> Rehacer</button>
+      </div>
+
+      <section class="panel accent" data-section="add-object" data-workspaces="model">
+        <h2>1. Agregar una forma</h2>
+        <p class="hint">Empieza con una forma básica. Después podrás ajustar sus medidas o esculpirla.</p>
+        <div class="primitive-grid">
+          <button data-primitive="box"><span class="primitive-icon">▣</span>Cubo</button>
+          <button data-primitive="sphere"><span class="primitive-icon">●</span>Esfera</button>
+          <button data-primitive="cylinder"><span class="primitive-icon">⬭</span>Cilindro</button>
+          <button data-primitive="cone"><span class="primitive-icon">▲</span>Cono</button>
+          <button data-primitive="torus"><span class="primitive-icon">◉</span>Toro</button>
+          <button data-primitive="plane"><span class="primitive-icon">▱</span>Plano</button>
+        </div>
+      </section>
+
+      <section class="panel panel--collapsed" id="shapeExtrudePanel" data-section="shape-extrude" data-workspaces="model">
+        <h2>2. Imagen 2D → objeto 3D</h2>
+        <p class="hint">Carga una imagen binaria, genera un SVG interno y extrúyelo para crear un objeto 3D editable.</p>
+        <div class="row two shape-actions">
+          <label class="file-btn wide-upload">Cargar imagen<input id="shapeImageInput" type="file" accept="image/png,image/jpeg,image/webp,image/bmp,image/gif" hidden /></label>
+          <button id="shapeDownloadSvgBtn" class="secondary-action" disabled>Descargar SVG</button>
+        </div>
+        <div class="shape-preview-grid">
+          <figure class="shape-preview-card">
+            <figcaption>Original</figcaption>
+            <canvas id="shapeSourcePreview" width="160" height="120"></canvas>
+          </figure>
+          <figure class="shape-preview-card">
+            <figcaption>Silueta</figcaption>
+            <canvas id="shapeBinaryPreview" width="160" height="120"></canvas>
+          </figure>
+          <figure class="shape-preview-card">
+            <figcaption>Vector</figcaption>
+            <canvas id="shapeVectorPreview" width="160" height="120"></canvas>
+          </figure>
+        </div>
+        <label class="range-label"><span>Umbral <output id="shapeThresholdValue">50%</output></span><input id="shapeThreshold" type="range" min="0" max="255" step="1" value="128" /></label>
+        <label class="range-label"><span>Eliminar ruido <output id="shapeNoiseAreaValue">8 px</output></span><input id="shapeNoiseArea" type="range" min="0" max="150" step="1" value="8" /></label>
+        <label class="range-label"><span>Suavizado <output id="shapeSmoothnessValue">20%</output></span><input id="shapeSmoothness" type="range" min="0" max="100" step="1" value="20" /></label>
+        <label class="range-label"><span>Simplificación <output id="shapeSimplifyValue">10%</output></span><input id="shapeSimplify" type="range" min="0" max="100" step="1" value="10" /></label>
+        <div class="row compact wrap dimension-options">
+          <label class="check"><input id="shapeInvert" type="checkbox" /> Invertir figura y fondo</label>
+          <label class="check"><input id="shapeLockAspect" type="checkbox" checked /> Mantener proporción</label>
+        </div>
+        <div class="dim-grid" aria-label="Dimensiones de la extrusión">
+          <label aria-label="Ancho final"><span>W</span><input id="shapeWidth" type="number" step="0.1" min="0.1" value="50" /></label>
+          <label aria-label="Alto final"><span>H</span><input id="shapeHeight" type="number" step="0.1" min="0.1" value="50" /></label>
+          <label aria-label="Profundidad"><span>D</span><input id="shapeDepth" type="number" step="0.1" min="0.1" value="4" /></label>
+        </div>
+        <label class="range-label"><span>Bisel <output id="shapeBevelValue">0.0 mm</output></span><input id="shapeBevel" type="range" min="0" max="5" step="0.1" value="0" /></label>
+        <div class="row two">
+          <button id="shapeRefreshBtn">Actualizar vector</button>
+          <button id="shapeGenerateBtn">Crear objeto 3D</button>
+        </div>
+        <p class="hint section-note" id="shapeInfo">Carga una silueta en blanco y negro para generar el contorno vectorial.</p>
+      </section>
+
+      <section class="panel" id="dimensionsPanel" data-section="dimensions" data-workspaces="model">
+        <h2>3. Ajustar medidas</h2>
+        <p class="hint">Introduce medidas exactas o usa las herramientas Mover, Rotar y Escalar.</p>
+        <label>Nombre del objeto<input id="objectName" type="text" autocomplete="off" /></label>
+        <div class="dim-grid" aria-label="Dimensiones del objeto">
+          <label aria-label="Dimensión X"><span>X</span><input id="dimX" type="number" step="0.01" min="0.01" /></label>
+          <label aria-label="Dimensión Y"><span>Y</span><input id="dimY" type="number" step="0.01" min="0.01" /></label>
+          <label aria-label="Dimensión Z"><span>Z</span><input id="dimZ" type="number" step="0.01" min="0.01" /></label>
+        </div>
+        <div class="row compact wrap dimension-options">
+          <label class="check"><input id="lockAspect" type="checkbox" /> Mantener proporción</label>
+          <label class="check"><input id="snapGrid" type="checkbox" checked /> Ajustar a grilla</label>
+        </div>
+        <label>Tamaño de grilla<input id="gridSize" type="number" step="0.05" min="0.05" value="0.25" /></label>
+        <button id="centerObjectBtn" class="wide-action">Apoyar y centrar en la grilla</button>
+      </section>
+
+      <section class="panel" data-section="scene" data-workspaces="all">
+        <h2>Objetos de la escena</h2>
+        <div id="objectList" class="object-list"></div>
+        <div class="row two">
+          <button id="duplicateBtn">Duplicar</button>
+          <button id="deleteBtn" class="danger">Eliminar</button>
+        </div>
+        <button id="loadLocalBtn" class="wide-action secondary-action" title="Recuperar la última copia guardada en este navegador">Recuperar copia guardada</button>
+      </section>
+
+      <section class="panel" data-section="view-mode" data-workspaces="model,sculpt,paint">
+        <h2>Vista del modelo</h2>
+        <label>Modo de visualización
+          <select id="viewMode">
+            <option value="pbr">Material y textura real</option>
+            <option value="matcapClay">Arcilla — recomendado para esculpir</option>
+            <option value="matcapGrey">Matcap gris</option>
+            <option value="matcapRed">Matcap rojo</option>
+          </select>
+        </label>
+        <label class="check view-check"><input id="wireframeToggle" type="checkbox" /> Mostrar malla sobre el modelo</label>
+        <p class="hint section-note">Las vistas Matcap y la malla solo cambian la visualización; no alteran la exportación.</p>
+      </section>
+
+      <section class="panel" id="meshToolsPanel" data-section="mesh" data-workspaces="sculpt">
+        <h2>Preparar la malla</h2>
+        <p class="hint">Aumenta el detalle antes de crear rasgos pequeños. Reduce polígonos si la interacción pierde fluidez.</p>
+        <div id="meshStats" class="mesh-stats">Sin objeto seleccionado</div>
+        <div id="meshQuality" class="quality-hint">Selecciona un objeto para evaluar su malla.</div>
+        <div class="row two">
+          <button id="subdivideMeshBtn" title="Añadir polígonos a toda la malla">Subdividir</button>
+          <button id="softRemeshBtn" title="Redistribuir los polígonos de la malla">Rehacer malla</button>
+        </div>
+        <div class="row two">
+          <button id="reduceMeshBtn" title="Reducir la cantidad de polígonos">Reducir polígonos</button>
+          <button id="relaxMeshBtn" title="Regularizar la distribución sin usar el pincel de suavizado">Relajar topología</button>
+        </div>
+      </section>
+
+      <section class="panel accent" data-section="sculpt" data-workspaces="sculpt">
+        <h2>Pincel de escultura</h2>
+        <label>Pincel
+          <select id="sculptMode">
+            <option value="brush">Añadir arcilla</option>
+            <option value="inflate" selected>Inflar volumen</option>
+            <option value="deflate">Hundir volumen</option>
+            <option value="twist">Retorcer</option>
+            <option value="smooth">Suavizar superficie</option>
+            <option value="flatten">Aplanar</option>
+            <option value="pinch">Pellizcar</option>
+            <option value="crease">Crease — surco / pliegue</option>
+            <option value="drag">Arrastrar superficie</option>
+            <option value="moveSurface">Mover zona</option>
+            <option value="masking">Pintar máscara</option>
+            <option value="localScale">Escala local</option>
+            <option value="transform">Transformar objeto</option>
+            <option value="noise">Textura orgánica</option>
+          </select>
+        </label>
+        <label class="range-label"><span>Radio del pincel <output id="brushRadiusValue">0.34</output></span><input id="brushRadius" type="range" min="0.03" max="1.8" step="0.01" value="0.34" /></label>
+        <label class="range-label"><span>Fuerza <output id="brushStrengthValue">0.030</output></span><input id="brushStrength" type="range" min="0.001" max="0.12" step="0.001" value="0.03" /></label>
+
+        <div id="smoothToolOptions" class="tool-options" hidden>
+          <div class="tool-options-head">
+            <strong>Suavizado</strong>
+            <span>Promedia la posición con los vértices vecinos.</span>
+          </div>
+          <div class="option-grid compact-options">
+            <label class="check" title="Reduce el encogimiento sin impedir que desaparezca el relieve"><input id="smoothPreserveVolume" type="checkbox" checked /> Conservar volumen</label>
+            <label class="check" title="Mueve solo sobre el plano tangente; es mucho más sutil"><input id="smoothTangent" type="checkbox" /> Solo tangencial</label>
+          </div>
+          <p class="hint">El modo tangencial conserva mejor la silueta, pero elimina menos los bultos profundos.</p>
+        </div>
+
+        <div id="creaseToolOptions" class="tool-options" hidden>
+          <div class="tool-options-head">
+            <strong>Crease</strong>
+            <span>Combina pellizco lateral y desplazamiento en profundidad.</span>
+          </div>
+          <label class="range-label"><span>Pinzado <output id="creasePinchValue">100%</output></span><input id="creasePinch" type="range" min="0" max="1.5" step="0.05" value="1" /></label>
+          <label class="range-label"><span>Profundidad <output id="creaseDepthValue">100%</output></span><input id="creaseDepth" type="range" min="0" max="1.5" step="0.05" value="1" /></label>
+          <p class="hint">Alt o “Invertir dirección” transforma el surco en una cresta elevada.</p>
+        </div>
+
+        <h3 class="control-group-title">Comportamiento del trazo</h3>
+        <div class="option-grid">
+          <label class="check"><input id="negative" type="checkbox" /> Invertir dirección</label>
+          <label class="check" data-sculpt-modes="brush"><input id="clay" type="checkbox" checked /> Perfil de arcilla</label>
+          <label class="check"><input id="accumulate" type="checkbox" checked /> Acumular sobre el trazo</label>
+          <label class="check"><input id="thinSurface" type="checkbox" /> Solo cara visible</label>
+          <label class="check"><input id="lockPosition" type="checkbox" /> Centro fijo por trazo</label>
+        </div>
+        <div class="symmetry-box">
+          <span>Simetría</span>
+          <label class="check"><input id="symmetry" type="checkbox" /> X</label>
+          <label class="check"><input id="symmetryY" type="checkbox" /> Y</label>
+          <label class="check"><input id="symmetryZ" type="checkbox" /> Z</label>
+        </div>
+      </section>
+
+      <section class="panel" data-section="dynamic-topology" data-workspaces="sculpt">
+        <h2>Detalle dinámico</h2>
+        <p class="hint">Añade polígonos únicamente bajo el pincel cuando el detalle existente no es suficiente.</p>
+        <label class="check feature-toggle" title="Añade polígonos solo debajo del pincel"><input id="dynamicTopology" type="checkbox" /> Activar detalle automático</label>
+        <label class="range-label"><span>Tamaño objetivo <output id="dynamicTopoValue">0.30</output></span><input id="dynamicTopoEdge" type="range" min="0.16" max="0.55" step="0.01" value="0.30" /></label>
+        <p class="hint section-note">Valores menores crean más polígonos y consumen más recursos. Actívalo solo para detalles finos.</p>
+      </section>
+
+      <section class="panel" data-section="mask" data-workspaces="sculpt">
+        <h2>Máscara de protección</h2>
+        <p class="hint">Selecciona “Pintar máscara” para bloquear zonas que no deben deformarse.</p>
+        <div class="row three mask-actions">
+          <button id="clearMaskBtn">Borrar</button>
+          <button id="invertMaskBtn">Invertir</button>
+          <button id="blurMaskBtn">Suavizar borde</button>
+        </div>
+      </section>
+
+      <section class="panel accent" data-section="paint-brush" data-workspaces="paint">
+        <h2>Pincel de pintura</h2>
+        <p class="hint">Pinta directamente sobre el objeto. El trazo se adapta a la superficie y cruza las costuras UV.</p>
+        <label>Color del pincel<input id="paintColor" type="color" value="#f05a28" /></label>
+        <label class="range-label"><span>Tamaño <output id="paintRadiusValue">36 px</output></span><input id="paintRadius" type="range" min="4" max="128" step="1" value="36" /></label>
+        <label class="range-label"><span>Opacidad <output id="paintOpacityValue">95%</output></span><input id="paintOpacity" type="range" min="0.05" max="1" step="0.05" value="0.95" /></label>
+        <div class="row two">
+          <label class="file-btn small">Cargar imagen<input id="textureInput" type="file" accept="image/*" hidden /></label>
+          <button id="clearTextureBtn">Limpiar pintura</button>
+        </div>
+      </section>
+
+      <section class="panel" data-section="material" data-workspaces="paint">
+        <h2>Material del objeto</h2>
+        <p class="hint">Estos valores cambian cómo reacciona la superficie a la luz.</p>
+        <label>Color base<input id="baseColor" type="color" value="#f5f0e7" /></label>
+        <label class="range-label"><span>Metal <output id="metalnessValue">0%</output></span><input id="metalness" type="range" min="0" max="1" step="0.01" value="0" /></label>
+        <label class="range-label"><span>Rugosidad <output id="roughnessValue">62%</output></span><input id="roughness" type="range" min="0" max="1" step="0.01" value="0.62" /></label>
+      </section>
+
+      <section class="panel accent export-panel" data-section="export" data-workspaces="export">
+        <h2>Exportar el resultado</h2>
+        <div class="format-guide">
+          <div><strong>GLB</strong><span>Modelo, color y textura. Recomendado para web, AR y presentación.</span></div>
+          <div><strong>STL</strong><span>Solo geometría. Recomendado para impresión 3D.</span></div>
+          <div><strong>OBJ</strong><span>Geometría compatible con otros programas 3D.</span></div>
+        </div>
+        <button id="exportGlbPanelBtn" class="primary-action">Exportar GLB completo</button>
+        <label>Formato STL
+          <select id="stlFormat">
+            <option value="binary" selected>Binario — archivo más pequeño</option>
+            <option value="ascii">ASCII — legible como texto</option>
+          </select>
+        </label>
+        <div class="row two">
+          <button id="exportStlSelectedBtn">STL seleccionado</button>
+          <button id="exportStlSceneBtn">STL de escena</button>
+        </div>
+        <div class="row two">
+          <button id="exportObjPanelBtn">Exportar OBJ</button>
+          <button id="saveTexturePanelBtn">Guardar textura PNG</button>
+        </div>
+      </section>
+    </aside>
+  </div>
+
+  <dialog id="helpDialog" class="help-dialog">
+    <form method="dialog">
+      <div class="dialog-head">
+        <div class="help-brand">
+          <img src="src/assets/icon-192.png" alt="" aria-hidden="true" />
+          <div>
+            <span>Guía rápida</span>
+            <h2>Cómo trabajar en SculptCAD</h2>
+          </div>
+        </div>
+        <button value="close" class="icon-button" aria-label="Cerrar ayuda">×</button>
+      </div>
+      <div class="help-grid">
+        <article><b>1</b><div><strong>Modelar</strong><p>Agrega una forma, selecciona el objeto y ajusta sus medidas.</p></div></article>
+        <article><b>2</b><div><strong>Esculpir</strong><p>Prepara la malla y usa Suavizar o Crease para corregir y definir el volumen.</p></div></article>
+        <article><b>3</b><div><strong>Pintar</strong><p>Aplica color o carga una imagen como textura.</p></div></article>
+        <article><b>4</b><div><strong>Exportar</strong><p>Usa GLB para conservar color o STL para impresión 3D.</p></div></article>
+      </div>
+      <h3>Atajos</h3>
+      <div class="shortcut-grid">
+        <span><kbd>V</kbd> Seleccionar</span><span><kbd>W</kbd> Mover</span><span><kbd>E</kbd> Rotar</span><span><kbd>R</kbd> Escalar</span>
+        <span><kbd>B</kbd> Esculpir</span><span><kbd>P</kbd> Pintar</span><span><kbd>M</kbd> Medir</span><span><kbd>F</kbd> Enfocar</span>
+        <span><kbd>Shift</kbd> Suavizar</span><span><kbd>Ctrl</kbd> Máscara</span><span><kbd>Alt</kbd> Invertir por trazo</span><span><kbd>N</kbd> Invertir persistente</span>
+        <span><kbd>1–4</kbd> Cambiar etapa</span><span><kbd>Ctrl Z</kbd> Deshacer</span><span><kbd>Ctrl Y</kbd> Rehacer</span><span><kbd>Ctrl Shift Z</kbd> Rehacer</span>
+      </div>
+      <p class="dialog-note"><strong>Crease:</strong> crea surcos y pliegues; Alt lo convierte en cresta. <strong>Suavizar:</strong> elimina relieve; “Solo tangencial” es una variante más leve.<br><br>Usa clic derecho para orbitar. La rueda acerca y aleja. En pantallas táctiles, un dedo orbita y dos dedos hacen zoom o desplazan.</p>
+    </form>
+  </dialog>
+
+  <script type="module" src="src/main.js"></script>
+</body>
+</html>

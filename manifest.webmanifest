@@ -1,0 +1,13 @@
+{
+  "name": "SculptCAD Pro",
+  "short_name": "SculptCAD",
+  "description": "Modelado, escultura, pintura y exportación 3D en el navegador.",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#070914",
+  "theme_color": "#070914",
+  "icons": [
+    { "src": "src/assets/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "src/assets/icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}

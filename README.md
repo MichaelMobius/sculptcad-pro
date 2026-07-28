@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="src/assets/logo-sculptcad-pro_github.png" width="620" alt="SculptCAD Pro" />
+  <img src="src/assets/sculptcad-pro_github.png" width="620" alt="SculptCAD Pro" />
 </p>
 
 <p align="center">

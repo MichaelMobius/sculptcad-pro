@@ -1,0 +1,42 @@
+export function createInitialState() {
+  return {
+    tool: 'select',
+    objects: [],
+    raycastTargets: [],
+    recordsByMesh: new Map(),
+    recordsById: new Map(),
+    selected: null,
+    isPointerDown: false,
+    isStroke: false,
+    strokeSnapshotDone: false,
+    activeStrokeHistory: null,
+    idCounter: 1,
+    undo: [],
+    redo: [],
+    undoBytes: 0,
+    redoBytes: 0,
+    maxHistoryBytes: 120 * 1024 * 1024,
+    maxHistory: 36,
+    measureStart: null,
+    measureLine: null,
+    measureLabel: null,
+    lastSculptHit: null,
+    lastPaintHit: null,
+    strokeStartHit: null,
+    strokeProxyObject: null,
+    strokeProxyPositions: null,
+    strokeProxySpatialIndex: null,
+    strokeProxySpatialSource: null,
+    moveSurfaceDataByKey: new Map(),
+    lastPointerClient: null,
+    transformDragStart: null,
+    transformDragAxis: null,
+    wireframeEnabled: false,
+    viewMode: 'pbr',
+    workspace: 'model',
+    wireframeDirty: new Set(),
+    // Meshes que necesitan recomputar normales/bounds al final del frame.
+    // Evita hacer computeVertexNormals() por cada sello del trazo.
+    sculptDirtyMeshes: new Set()
+  };
+}

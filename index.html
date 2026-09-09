@@ -36,11 +36,20 @@
 
       <nav class="top-actions" aria-label="Acciones del proyecto">
         <button id="newSceneBtn" title="Crear una escena nueva">Nuevo</button>
-        <label class="file-btn" title="Importar OBJ, STL, GLTF o GLB">
+        <label class="file-btn" title="Importar OBJ, STL, GLB o glTF autocontenido">
           Importar
           <input id="modelInput" type="file" accept=".obj,.stl,.gltf,.glb" hidden />
         </label>
         <button id="saveLocalTopBtn" title="Guardar una copia en este navegador">Guardar copia</button>
+        <details class="mobile-project-menu">
+          <summary aria-label="Acciones del proyecto" title="Acciones del proyecto">⋯</summary>
+          <div class="mobile-project-popover">
+            <button id="mobileNewSceneBtn"><strong>Nueva escena</strong><span>Empezar un proyecto vacío</span></button>
+            <button id="mobileImportBtn"><strong>Importar modelo</strong><span>OBJ, STL, GLB o glTF autocontenido</span></button>
+            <button id="mobileSaveBtn"><strong>Guardar copia</strong><span>Guardar en este navegador</span></button>
+            <button id="mobileLoadBtn"><strong>Recuperar copia</strong><span>Abrir el último guardado local</span></button>
+          </div>
+        </details>
         <details class="export-menu">
           <summary>Exportar</summary>
           <div class="export-popover">
@@ -203,6 +212,16 @@
         <button id="loadLocalBtn" class="wide-action secondary-action" title="Recuperar la última copia guardada en este navegador">Recuperar copia guardada</button>
       </section>
 
+      <section class="panel" data-section="import-settings" data-workspaces="model">
+        <h2>Importación</h2>
+        <p class="hint">El límite protege la memoria del navegador al abrir modelos grandes. Puedes aumentarlo cuando tu equipo tenga recursos suficientes.</p>
+        <label class="range-label" for="modelFileLimit">
+          <span>Límite de archivo <output id="modelFileLimitValue">64 MB</output></span>
+          <input id="modelFileLimit" type="range" min="64" max="100" step="1" value="64" aria-describedby="modelFileLimitHint" />
+        </label>
+        <p class="hint section-note" id="modelFileLimitHint">64 MB es el valor recomendado. El máximo configurable es 100 MB.</p>
+      </section>
+
       <section class="panel" data-section="view-mode" data-workspaces="model,sculpt,paint">
         <h2>Vista del modelo</h2>
         <label>Modo de visualización
@@ -224,7 +243,7 @@
         <div id="meshQuality" class="quality-hint">Selecciona un objeto para evaluar su malla.</div>
         <div class="row two">
           <button id="subdivideMeshBtn" title="Añadir polígonos a toda la malla">Subdividir</button>
-          <button id="softRemeshBtn" title="Redistribuir los polígonos de la malla">Rehacer malla</button>
+          <button id="softRemeshBtn" title="Aumentar detalle y regularizar la distribución de polígonos">Subdividir + relajar</button>
         </div>
         <div class="row two">
           <button id="reduceMeshBtn" title="Reducir la cantidad de polígonos">Reducir polígonos</button>
@@ -323,12 +342,39 @@
         </div>
       </section>
 
-      <section class="panel" data-section="material" data-workspaces="paint">
+      <section class="panel material-panel" data-section="material" data-workspaces="paint">
         <h2>Material del objeto</h2>
-        <p class="hint">Estos valores cambian cómo reacciona la superficie a la luz.</p>
-        <label>Color base<input id="baseColor" type="color" value="#f5f0e7" /></label>
-        <label class="range-label"><span>Metal <output id="metalnessValue">0%</output></span><input id="metalness" type="range" min="0" max="1" step="0.01" value="0" /></label>
-        <label class="range-label"><span>Rugosidad <output id="roughnessValue">62%</output></span><input id="roughness" type="range" min="0" max="1" step="0.01" value="0.62" /></label>
+        <p class="hint">Elige un material listo para usar o construye uno propio. Los presets también se conservan al exportar GLB.</p>
+
+        <div class="material-mode-tabs" role="tablist" aria-label="Modo de material">
+          <button id="materialPresetTab" type="button" role="tab" aria-selected="true" class="active">Preset</button>
+          <button id="materialCustomTab" type="button" role="tab" aria-selected="false">Custom</button>
+        </div>
+
+        <div id="materialPresetPanel" class="material-tab-panel" role="tabpanel">
+          <div id="materialPresetCatalog" class="material-preset-catalog"></div>
+          <p class="hint section-note">Aplicar un preset sustituye la apariencia base actual. Puedes recuperar el estado anterior con Deshacer.</p>
+        </div>
+
+        <div id="materialCustomPanel" class="material-tab-panel" role="tabpanel" hidden>
+          <label>Color<input id="baseColor" type="color" value="#f5f0e7" /></label>
+          <label class="range-label"><span>Reflexión <output id="metalnessValue">0%</output></span><input id="metalness" type="range" min="0" max="1" step="0.01" value="0" /></label>
+          <label class="range-label"><span>Brillo <output id="roughnessValue">38%</output></span><input id="roughness" type="range" min="0" max="1" step="0.01" value="0.38" /></label>
+          <label>Textura superficial
+            <select id="materialTextureType">
+              <option value="none">Lisa</option>
+              <option value="brushed">Cepillada</option>
+              <option value="hammered">Martillada</option>
+              <option value="stripes">Franjas</option>
+              <option value="grid">Grid</option>
+              <option value="noise">Granulada</option>
+            </select>
+          </label>
+          <label class="range-label"><span>Intensidad de textura <output id="materialTextureStrengthValue">50%</output></span><input id="materialTextureStrength" type="range" min="0" max="1" step="0.05" value="0.5" /></label>
+          <label class="range-label"><span>Tamaño de textura <output id="materialTextureSizeValue">1.0×</output></span><input id="materialTextureSize" type="range" min="0.25" max="4" step="0.25" value="1" /></label>
+          <button id="applyCustomMaterialBtn" class="primary-action" type="button">Aplicar material Custom</button>
+          <p class="hint section-note">Custom usa parámetros PBR: Reflexión controla la metalidad y Brillo controla la suavidad aparente de los reflejos.</p>
+        </div>
       </section>
 
       <section class="panel accent export-panel" data-section="export" data-workspaces="export">
@@ -386,6 +432,22 @@
     </form>
   </dialog>
 
+  <script>
+    window.__sculptStartupWatchdog = window.setTimeout(() => {
+      const splash = document.getElementById('startupSplash');
+      if (!splash || splash.classList.contains('is-hidden')) return;
+      const small = splash.querySelector('small');
+      const loader = splash.querySelector('.startup-loader');
+      if (loader) loader.style.display = 'none';
+      if (small) small.textContent = 'No se pudo iniciar la aplicación. Comprueba tu conexión e inténtalo de nuevo.';
+    }, 8000);
+    window.addEventListener('error', () => {
+      const splash = document.getElementById('startupSplash');
+      if (!splash || splash.classList.contains('is-hidden')) return;
+      const small = splash.querySelector('small');
+      if (small) small.textContent = 'Error al cargar los módulos de la aplicación. Comprueba tu conexión.';
+    });
+  </script>
   <script type="module" src="src/main.js"></script>
 </body>
 </html>

@@ -17,6 +17,7 @@ import { cloneTypedArray, setIndexAttribute } from './utils/buffers.js';
 import { downloadBlob } from './io/download.js';
 import { applySculptTool } from './sculpt/ToolRegistry.js';
 import { geometryStats, localSubdivideGeometry } from './utils/remesh.js';
+import { MATERIAL_PRESET_GROUPS, getMaterialPreset, paintMaterialPreset, paintCustomMaterial } from './core/materialPresets.js';
 
 // ─── Vectores temporales reutilizables ───────────────────────────────────────
 // Evitan alocación de objetos por frame (patrón SculptGL).
@@ -43,10 +44,16 @@ const state = createInitialState();
 let meshWorker = null;
 let meshWorkerSeq = 1;
 const meshWorkerJobs = new Map();
+let vectorWorker = null;
+let vectorWorkerSeq = 1;
+const vectorWorkerJobs = new Map();
+let vectorRefreshTimer = null;
 const paintBrushCache = new Map();
 const rasterVectorState = {
   sourceName: '',
   sourceCanvas: document.createElement('canvas'),
+  sourcePixels: null,
+  vectorGeneration: 0,
   mask: null,
   width: 0,
   height: 0,
@@ -81,7 +88,7 @@ const {
     if (!state.selected) return;
     state.transformDragStart = state.selected.position.clone();
     state.transformDragAxis = transform.axis || null;
-    pushObjectHistory('Transformar objeto');
+    pushObjectMetaHistory('Transformar objeto');
   },
   onTransformMouseUp: () => {
     state.transformDragStart = null;
@@ -91,6 +98,7 @@ const {
   },
   onTransformObjectChange: () => {
     constrainTransformToActiveAxes();
+    if (transform.getMode?.() === 'scale') clampObjectScale(state.selected);
     if (transform.getMode && transform.getMode() === 'translate') {
       applySnapping(transform.dragging ? (transform.axis || state.transformDragAxis) : null);
     }
@@ -116,12 +124,67 @@ const WORKSPACE_HINTS = {
   export: 'Elige GLB para conservar color o STL para impresión 3D.'
 };
 
+const DEFAULT_MODEL_FILE_LIMIT_MB = 64;
+const MAX_MODEL_FILE_LIMIT_MB = 100;
+const MODEL_FILE_LIMIT_STORAGE_KEY = 'scp-model-file-limit-mb';
+let modelFileLimitMB = DEFAULT_MODEL_FILE_LIMIT_MB;
+try {
+  const storedLimit = Number(localStorage.getItem(MODEL_FILE_LIMIT_STORAGE_KEY));
+  if (Number.isFinite(storedLimit)) {
+    modelFileLimitMB = THREE.MathUtils.clamp(Math.round(storedLimit), DEFAULT_MODEL_FILE_LIMIT_MB, MAX_MODEL_FILE_LIMIT_MB);
+  }
+} catch {}
+
+function getMaxModelFileBytes() {
+  return modelFileLimitMB * 1024 * 1024;
+}
+
+const MAX_IMAGE_FILE_BYTES = 40 * 1024 * 1024;
+const MAX_TEXTURE_FILE_BYTES = 20 * 1024 * 1024;
+const MAX_IMAGE_PIXELS = 40_000_000;
+const MAX_IMPORT_VERTICES = 1_500_000;
+const MAX_SPATIAL_QUERY_CELLS = 120_000;
+const MIN_OBJECT_SCALE_ABS = 1e-3;
+const MAX_VECTOR_CONTOURS = 20_000;
+const MAX_VECTOR_POINTS = 250_000;
+const PAINT_HISTORY_TILE_SIZE = 64;
+
 function setStatus(text) {
   statusEl.textContent = text;
   statusEl.title = text;
 }
 
+function ensureRecordGeometryVersion(record) {
+  if (!record) return 0;
+  if (!Number.isInteger(record.geometryVersion)) record.geometryVersion = 0;
+  return record.geometryVersion;
+}
+
+function bumpRecordGeometryVersion(record) {
+  if (!record) return 0;
+  record.geometryVersion = ensureRecordGeometryVersion(record) + 1;
+  return record.geometryVersion;
+}
+
+function createMeshOperationGuard(record) {
+  return {
+    recordId: record?.id ?? null,
+    geometry: record?.mesh?.geometry ?? null,
+    geometryVersion: ensureRecordGeometryVersion(record)
+  };
+}
+
+function resolveMeshOperationGuard(guard) {
+  if (!guard || guard.recordId === null) return null;
+  const record = state.recordsById.get(guard.recordId);
+  if (!record) return null;
+  if (record.mesh.geometry !== guard.geometry) return null;
+  if (ensureRecordGeometryVersion(record) !== guard.geometryVersion) return null;
+  return record;
+}
+
 function hideStartupSplash() {
+  window.clearTimeout(window.__sculptStartupWatchdog);
   const splash = document.getElementById('startupSplash');
   if (!splash) return;
   splash.classList.add('is-hidden');
@@ -172,11 +235,14 @@ function updateRangeOutputs() {
   if (ui.paintOpacityValue) ui.paintOpacityValue.value = `${Math.round(Number(ui.paintOpacity.value) * 100)}%`;
   if (ui.metalnessValue) ui.metalnessValue.value = `${Math.round(Number(ui.metalness.value) * 100)}%`;
   if (ui.roughnessValue) ui.roughnessValue.value = `${Math.round(Number(ui.roughness.value) * 100)}%`;
+  if (ui.materialTextureStrengthValue) ui.materialTextureStrengthValue.value = `${Math.round(Number(ui.materialTextureStrength?.value || 0) * 100)}%`;
+  if (ui.materialTextureSizeValue) ui.materialTextureSizeValue.value = `${Number(ui.materialTextureSize?.value || 1).toFixed(2).replace(/0$/, '').replace(/\.$/, '')}×`;
   if (ui.shapeThresholdValue) ui.shapeThresholdValue.value = `${Math.round((Number(ui.shapeThreshold.value) / 255) * 100)}%`;
   if (ui.shapeNoiseAreaValue) ui.shapeNoiseAreaValue.value = `${Math.round(Number(ui.shapeNoiseArea.value))} px`;
   if (ui.shapeSmoothnessValue) ui.shapeSmoothnessValue.value = `${Math.round(Number(ui.shapeSmoothness.value))}%`;
   if (ui.shapeSimplifyValue) ui.shapeSimplifyValue.value = `${Math.round(Number(ui.shapeSimplify.value))}%`;
   if (ui.shapeBevelValue) ui.shapeBevelValue.value = `${Number(ui.shapeBevel.value).toFixed(1)} mm`;
+  if (ui.modelFileLimitValue) ui.modelFileLimitValue.value = `${Math.round(modelFileLimitMB)} MB`;
 }
 
 /**
@@ -293,6 +359,7 @@ function getPbrMaterial(record) {
 
 function registerRecord(record) {
   ensureRecordMaterialState(record);
+  ensureRecordGeometryVersion(record);
   state.recordsByMesh.set(record.mesh, record);
   state.recordsById.set(record.id, record);
   if (!state.raycastTargets.includes(record.mesh)) state.raycastTargets.push(record.mesh);
@@ -402,11 +469,16 @@ function buildSculptTopology(geometry) {
   // Evita crear una cadena `${x},${y},${z}` por vértice. Los niveles de Map
   // conservan claves numéricas exactas y no introducen colisiones de hash.
   const keyToGroup = new Map();
+  geometry.computeBoundingBox();
+  const diagonal = geometry.boundingBox ? geometry.boundingBox.min.distanceTo(geometry.boundingBox.max) : 1;
+  // Tolerancia adaptativa: conserva la soldadura exacta de STL/costuras UV sin
+  // unir por error láminas muy próximas en modelos de escala pequeña.
+  const weldEpsilon = Math.max(1e-9, Math.min(SCULPT_WELD_EPSILON, diagonal * 1e-7));
 
   for (let i = 0; i < position.count; i++) {
-    const x = Math.round(position.getX(i) / SCULPT_WELD_EPSILON);
-    const y = Math.round(position.getY(i) / SCULPT_WELD_EPSILON);
-    const z = Math.round(position.getZ(i) / SCULPT_WELD_EPSILON);
+    const x = Math.round(position.getX(i) / weldEpsilon);
+    const y = Math.round(position.getY(i) / weldEpsilon);
+    const z = Math.round(position.getZ(i) / weldEpsilon);
     let groupId = getWeldedGroupId(keyToGroup, x, y, z);
     if (groupId === undefined) {
       groupId = groups.length;
@@ -462,28 +534,41 @@ function buildSculptTopology(geometry) {
   return geometry.userData.sculptTopology;
 }
 
-function smoothNormalsByWeldedGroups(geometry) {
+function smoothNormalsByWeldedGroups(geometry, angleThresholdDeg = 52) {
   const normal = geometry.getAttribute('normal');
   const topology = geometry.userData.sculptTopology;
   if (!normal || !topology?.groups) return;
 
-  // SphereGeometry y muchas mallas importadas duplican vértices en la costura UV.
-  // Aunque esas posiciones estén soldadas para esculpir, computeVertexNormals()
-  // calcula normales separadas porque la topología real está partida por la UV.
-  // Promediamos las normales de cada grupo soldado y las copiamos a sus duplicados
-  // para que la iluminación no revele una línea vertical.
-  const averaged = new THREE.Vector3();
+  // Suaviza costuras UV sin destruir aristas duras. Los duplicados de una costura
+  // suave tienen normales similares; los duplicados intencionales de un canto CAD
+  // suelen diferir mucho. Agrupamos por dirección antes de promediar.
+  const cosThreshold = Math.cos(THREE.MathUtils.degToRad(angleThresholdDeg));
+  const sample = new THREE.Vector3();
+  const sum = new THREE.Vector3();
   for (const group of topology.groups) {
-    averaged.set(0, 0, 0);
+    if (!group.vertices?.length || group.vertices.length === 1) continue;
+    const clusters = [];
     for (const vertexIndex of group.vertices) {
-      averaged.x += normal.getX(vertexIndex);
-      averaged.y += normal.getY(vertexIndex);
-      averaged.z += normal.getZ(vertexIndex);
+      sample.set(normal.getX(vertexIndex), normal.getY(vertexIndex), normal.getZ(vertexIndex));
+      if (sample.lengthSq() === 0) continue;
+      sample.normalize();
+      let cluster = null;
+      for (const candidate of clusters) {
+        if (candidate.direction.dot(sample) >= cosThreshold) { cluster = candidate; break; }
+      }
+      if (!cluster) {
+        cluster = { direction: sample.clone(), vertices: [], sum: new THREE.Vector3() };
+        clusters.push(cluster);
+      }
+      cluster.vertices.push(vertexIndex);
+      cluster.sum.add(sample);
+      cluster.direction.copy(cluster.sum).normalize();
     }
-    if (averaged.lengthSq() === 0) continue;
-    averaged.normalize();
-    for (const vertexIndex of group.vertices) {
-      normal.setXYZ(vertexIndex, averaged.x, averaged.y, averaged.z);
+    for (const cluster of clusters) {
+      sum.copy(cluster.sum);
+      if (sum.lengthSq() === 0) continue;
+      sum.normalize();
+      for (const vertexIndex of cluster.vertices) normal.setXYZ(vertexIndex, sum.x, sum.y, sum.z);
     }
   }
   normal.needsUpdate = true;
@@ -661,6 +746,16 @@ function querySpatialIndex(index, localPoint, localRadius, target = []) {
   const maxY = Math.floor((localPoint.y + localRadius) / cellSize);
   const minZ = Math.floor((localPoint.z - localRadius) / cellSize);
   const maxZ = Math.floor((localPoint.z + localRadius) / cellSize);
+  const cellCount = (maxX - minX + 1) * (maxY - minY + 1) * (maxZ - minZ + 1);
+
+  // Escalas muy anisotrópicas pueden convertir un pincel pequeño en una esfera
+  // local gigantesca. Evitamos millones de búsquedas de celdas y usamos un
+  // fallback lineal sobre los grupos, cuya distancia exacta se valida después.
+  if (!Number.isFinite(cellCount) || cellCount > MAX_SPATIAL_QUERY_CELLS) {
+    const groupCount = Math.floor((index.centers?.length || 0) / 3);
+    for (let groupId = 0; groupId < groupCount; groupId++) target.push(groupId);
+    return target;
+  }
 
   for (let x = minX; x <= maxX; x++) {
     for (let y = minY; y <= maxY; y++) {
@@ -800,6 +895,7 @@ function addPrimitive(type = 'sphere', options = {}) {
     textureSet,
     pbrMaterial: mesh.material,
     matcapMaterials: new Map(),
+    materialPresetId: null,
     createdAt: Date.now()
   };
   mesh.userData.recordId = record.id;
@@ -830,7 +926,7 @@ function selectObject(mesh) {
 }
 
 function setTransformModeFromTool() {
-  const transformActive = !!state.selected && isTransformTool();
+  const transformActive = !!state.selected && state.selected.visible !== false && isTransformTool();
 
   // Bug fix: TransformControls must be fully disabled/detached while sculpting,
   // painting or measuring. Hiding the gizmo with visible=false is not enough:
@@ -885,6 +981,113 @@ function setInspectorCollapsed(collapsed) {
   scheduleViewportResize();
 }
 
+
+function setMaterialMode(mode = 'preset') {
+  const presetMode = mode !== 'custom';
+  if (ui.materialPresetPanel) ui.materialPresetPanel.hidden = !presetMode;
+  if (ui.materialCustomPanel) ui.materialCustomPanel.hidden = presetMode;
+  if (ui.materialPresetTab) {
+    ui.materialPresetTab.classList.toggle('active', presetMode);
+    ui.materialPresetTab.setAttribute('aria-selected', String(presetMode));
+  }
+  if (ui.materialCustomTab) {
+    ui.materialCustomTab.classList.toggle('active', !presetMode);
+    ui.materialCustomTab.setAttribute('aria-selected', String(!presetMode));
+  }
+}
+
+function syncMaterialPresetSelection(rec = getRecord()) {
+  const activeId = rec?.materialPresetId || '';
+  document.querySelectorAll('[data-material-preset]').forEach((button) => {
+    const active = button.dataset.materialPreset === activeId;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-pressed', String(active));
+  });
+}
+
+function renderMaterialPresetCatalog() {
+  const host = ui.materialPresetCatalog;
+  if (!host || host.dataset.ready === '1') return;
+  host.textContent = '';
+  for (const group of MATERIAL_PRESET_GROUPS) {
+    const section = document.createElement('section');
+    section.className = 'material-family';
+    const head = document.createElement('div');
+    head.className = 'material-family-head';
+    const title = document.createElement('h3');
+    title.textContent = group.label;
+    const count = document.createElement('small');
+    count.textContent = `${group.presets.length} presets`;
+    head.append(title, count);
+    const grid = document.createElement('div');
+    grid.className = 'material-preset-grid';
+    for (const preset of group.presets) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'material-preset-card';
+      button.dataset.materialPreset = preset.id;
+      button.setAttribute('aria-pressed', 'false');
+      button.title = `${group.label} — ${preset.label}`;
+      const preview = document.createElement('canvas');
+      preview.width = 180;
+      preview.height = 112;
+      paintMaterialPreset(preview, preset.id);
+      const label = document.createElement('span');
+      label.textContent = preset.label;
+      button.append(preview, label);
+      button.addEventListener('click', () => applyMaterialPresetById(preset.id));
+      grid.append(button);
+    }
+    section.append(head, grid);
+    host.append(section);
+  }
+  host.dataset.ready = '1';
+}
+
+function applyMaterialPresetById(presetId) {
+  const rec = getRecord();
+  const preset = getMaterialPreset(presetId);
+  if (!rec || !preset) {
+    setStatus('Selecciona un objeto antes de aplicar un material.');
+    return;
+  }
+  pushObjectHistory(`Aplicar material ${preset.label}`, rec.mesh, { includeTexture: true });
+  paintMaterialPreset(rec.textureSet.canvas, presetId);
+  rec.textureSet.texture.needsUpdate = true;
+  const pbr = getPbrMaterial(rec);
+  pbr.metalness = preset.metalness;
+  pbr.roughness = preset.roughness;
+  pbr.needsUpdate = true;
+  rec.materialPresetId = presetId;
+  ui.metalness.value = String(preset.metalness);
+  ui.roughness.value = String(1 - preset.roughness);
+  ui.baseColor.value = sampleCanvasBaseColor(rec.textureSet.canvas);
+  updateRangeOutputs();
+  syncMaterialPresetSelection(rec);
+  if (state.viewMode === 'pbr') rec.mesh.material = pbr;
+  setStatus(`Material aplicado: ${preset.label}`);
+}
+
+function applyCustomMaterial() {
+  const rec = getRecord();
+  if (!rec) {
+    setStatus('Selecciona un objeto antes de aplicar un material Custom.');
+    return;
+  }
+  pushObjectHistory('Aplicar material Custom', rec.mesh, { includeTexture: true });
+  paintCustomMaterial(rec.textureSet.canvas, {
+    color: ui.baseColor.value,
+    texture: ui.materialTextureType?.value || 'none',
+    strength: Number(ui.materialTextureStrength?.value || 0.5),
+    size: Number(ui.materialTextureSize?.value || 1)
+  });
+  rec.textureSet.texture.needsUpdate = true;
+  rec.materialPresetId = null;
+  updateMaterial();
+  syncMaterialPresetSelection(rec);
+  setStatus('Material Custom aplicado');
+}
+
 function updateInspector() {
   const mesh = state.selected;
   const enabled = !!mesh;
@@ -896,6 +1099,7 @@ function updateInspector() {
   if (!mesh) {
     ui.objectName.value = '';
     ui.dimX.value = ui.dimY.value = ui.dimZ.value = '';
+    syncMaterialPresetSelection(null);
     updateMeshStats();
     return;
   }
@@ -905,7 +1109,8 @@ function updateInspector() {
     ui.baseColor.value = sampleCanvasBaseColor(rec.textureSet.canvas);
     const pbr = getPbrMaterial(rec);
     ui.metalness.value = pbr.metalness;
-    ui.roughness.value = pbr.roughness;
+    ui.roughness.value = 1 - pbr.roughness;
+    syncMaterialPresetSelection(rec);
   }
   updateDimensionInputs();
   updateRangeOutputs();
@@ -972,15 +1177,17 @@ function confirmMeshOperation(label, before, after, force = false) {
   return window.confirm(geometryWarningMessage(label, before, after));
 }
 
-function replaceSelectedGeometry(newGeometry, label) {
-  const rec = getRecord();
-  if (!rec || !newGeometry) return;
+function replaceRecordGeometry(rec, newGeometry, label) {
+  if (!rec || !newGeometry || !state.recordsById.has(rec.id)) {
+    newGeometry?.dispose?.();
+    return false;
+  }
   pushObjectHistory(label, rec.mesh);
   const oldGeometry = rec.mesh.geometry;
   disposeWireframeOverlay(rec);
-  rec.mesh.geometry = prepareGeometry(newGeometry);
+  rec.mesh.geometry = prepareGeometry(newGeometry, { clone: false });
   oldGeometry?.dispose?.();
-  newGeometry.dispose?.();
+  bumpRecordGeometryVersion(rec);
   rec.mesh.geometry.computeBoundingBox();
   rec.mesh.geometry.computeBoundingSphere();
   markWireframeDirty(rec);
@@ -989,6 +1196,17 @@ function replaceSelectedGeometry(newGeometry, label) {
   renderObjectList();
   updateHistoryButtons();
   setStatus(`${label}: topología actualizada`);
+  return true;
+}
+
+function applyWorkerGeometryResult(guard, newGeometry, label) {
+  const rec = resolveMeshOperationGuard(guard);
+  if (!rec) {
+    newGeometry?.dispose?.();
+    setStatus(`${label}: resultado descartado porque el objeto cambió durante el cálculo`);
+    return false;
+  }
+  return replaceRecordGeometry(rec, newGeometry, label);
 }
 
 
@@ -1001,39 +1219,60 @@ function shouldUseDynamicTopology(mode) {
   return ['brush', 'inflate', 'deflate', 'pinch', 'crease', 'flatten', 'smooth', 'noise', 'localScale'].includes(mode);
 }
 
-function applyDynamicTopologyIfNeeded(mesh, hit, radius, mode) {
+function applyDynamicTopologyIfNeeded(mesh, hits, radius, mode) {
   if (!shouldUseDynamicTopology(mode)) return false;
   const rec = getRecord(mesh);
   if (!rec) return false;
   const before = geometryStats(mesh.geometry);
   if (before.triangles > 360000) {
-    setStatus('Dynamic topology pausado: malla demasiado pesada. Usa Reducir malla o Remesh suave.');
+    setStatus('Dynamic topology pausado: malla demasiado pesada. Usa Reducir malla o Subdividir + relajar.');
     return false;
   }
 
   mesh.updateMatrixWorld(true);
   const invWorld = tmpM.copy(mesh.matrixWorld).invert();
-  const localPoint = tmpLocal.copy(hit.point).applyMatrix4(invWorld).clone();
+  const hitList = Array.isArray(hits) ? hits.filter(Boolean) : [hits].filter(Boolean);
+  if (!hitList.length) return false;
+  const localPoints = hitList.map((hit) => hit.point.clone().applyMatrix4(invWorld));
+  const localPoint = localPoints[0];
   const localRadius = worldRadiusToSafeLocalRadius(mesh, radius);
   const detail = THREE.MathUtils.clamp(parseFloat(ui.dynamicTopoEdge?.value || '0.30'), 0.12, 0.8);
-  const maxEdgeLength = Math.max(localRadius * detail, 0.0035);
+  mesh.matrixWorld.decompose(tmpV, tmpQ, tmpScale);
+  const maxWorldScale = Math.max(1e-6, Math.abs(tmpScale.x), Math.abs(tmpScale.y), Math.abs(tmpScale.z));
+  // El umbral de arista se deriva del radio en espacio mundo usando la escala
+  // máxima; así una pieza muy aplanada no desactiva el detalle dinámico.
+  const maxEdgeLength = Math.max((radius * detail) / maxWorldScale, 0.0035);
   const maxTriangles = before.triangles > 180000 ? 320 : before.triangles > 90000 ? 520 : 900;
 
   const topology = getSculptTopology(mesh.geometry);
   const spatialIndex = getCurrentSpatialIndex(mesh.geometry, topology);
-  const nearbyGroups = querySpatialIndex(
-    spatialIndex,
-    localPoint,
-    localRadius * 1.35,
-    topology.spatialQueryResult
-  );
   const candidateSet = new Set();
-  for (const groupId of nearbyGroups) {
-    for (const tri of topology.groups[groupId]?.triangles || []) candidateSet.add(tri);
+  for (const point of localPoints) {
+    const nearbyGroups = querySpatialIndex(
+      spatialIndex,
+      point,
+      localRadius * 1.35,
+      topology.spatialQueryResult
+    );
+    for (const groupId of nearbyGroups) {
+      const centerOffset = groupId * 3;
+      tmpV2.set(
+        spatialIndex.centers[centerOffset],
+        spatialIndex.centers[centerOffset + 1],
+        spatialIndex.centers[centerOffset + 2]
+      ).applyMatrix4(mesh.matrixWorld);
+      let withinAnyRegion = false;
+      for (const worldHit of hitList) {
+        if (tmpV2.distanceTo(worldHit.point) <= radius * 1.45) { withinAnyRegion = true; break; }
+      }
+      if (!withinAnyRegion) continue;
+      for (const tri of topology.groups[groupId]?.triangles || []) candidateSet.add(tri);
+    }
   }
 
   const result = localSubdivideGeometry(mesh.geometry, {
     center: localPoint,
+    centers: localPoints,
     radius: localRadius * 1.08,
     maxEdgeLength,
     maxTriangles,
@@ -1062,6 +1301,7 @@ function applyDynamicTopologyIfNeeded(mesh, hit, radius, mode) {
     state.strokeProxySpatialSource = null;
   }
 
+  bumpRecordGeometryVersion(rec);
   markSpatialIndexStale(mesh.geometry);
   state.sculptDirtyMeshes.add(mesh);
   markWireframeDirty(mesh);
@@ -1126,7 +1366,8 @@ function setMeshOperationBusy(isBusy, label = 'Procesando malla') {
   [ui.subdivideMeshBtn, ui.softRemeshBtn, ui.reduceMeshBtn, ui.relaxMeshBtn].forEach((button) => {
     if (button) button.disabled = isBusy;
   });
-  if (isBusy) setStatus(`${label}… la interfaz sigue activa`);
+  updateHistoryButtons();
+  if (isBusy) setStatus(`${label}… puedes navegar, pero la geometría queda bloqueada hasta terminar`);
 }
 
 function runMeshWorkerOperation(operation, geometry, options = {}) {
@@ -1146,9 +1387,10 @@ async function subdivideSelectedMesh() {
   const after = { vertices: before.vertices * 2, triangles: before.triangles * 4 };
   if (!confirmMeshOperation('Subdividir malla', before, after, before.triangles > 55000)) return;
   try {
+    const guard = createMeshOperationGuard(rec);
     setMeshOperationBusy(true, 'Subdividiendo malla en worker');
-    const next = await runMeshWorkerOperation('subdivide', rec.mesh.geometry);
-    replaceSelectedGeometry(next, 'Subdividir malla');
+    const next = await runMeshWorkerOperation('subdivide', guard.geometry);
+    applyWorkerGeometryResult(guard, next, 'Subdividir malla');
   } catch (err) {
     console.error(err);
     setStatus('No se pudo subdividir la malla. Revisa la consola.');
@@ -1165,14 +1407,15 @@ async function softRemeshSelectedMesh() {
   const after = shouldSubdivide
     ? { vertices: before.vertices * 2, triangles: before.triangles * 4 }
     : { vertices: before.vertices, triangles: before.triangles };
-  if (!confirmMeshOperation('Remesh suave', before, after, true)) return;
+  if (!confirmMeshOperation('Subdividir + relajar', before, after, true)) return;
   try {
-    setMeshOperationBusy(true, 'Remesh suave en worker');
-    const next = await runMeshWorkerOperation('softRemesh', rec.mesh.geometry, { subdivide: shouldSubdivide, relaxIterations: shouldSubdivide ? 5 : 7 });
-    replaceSelectedGeometry(next, 'Remesh suave');
+    const guard = createMeshOperationGuard(rec);
+    setMeshOperationBusy(true, 'Subdividiendo y relajando en worker');
+    const next = await runMeshWorkerOperation('softRemesh', guard.geometry, { subdivide: shouldSubdivide, relaxIterations: shouldSubdivide ? 5 : 7 });
+    applyWorkerGeometryResult(guard, next, 'Subdividir + relajar');
   } catch (err) {
     console.error(err);
-    setStatus('No se pudo remeshear esta malla. Revisa la consola.');
+    setStatus('No se pudo subdividir y relajar esta malla. Revisa la consola.');
   } finally {
     setMeshOperationBusy(false);
   }
@@ -1184,9 +1427,10 @@ async function relaxSelectedMesh() {
   const before = geometryStats(rec.mesh.geometry);
   if (!confirmMeshOperation('Relajar malla', before, before, before.vertices > 140000)) return;
   try {
+    const guard = createMeshOperationGuard(rec);
     setMeshOperationBusy(true, 'Relajando malla en worker');
-    const next = await runMeshWorkerOperation('relax', rec.mesh.geometry, { iterations: 6 });
-    replaceSelectedGeometry(next, 'Relajar malla');
+    const next = await runMeshWorkerOperation('relax', guard.geometry, { iterations: 6 });
+    applyWorkerGeometryResult(guard, next, 'Relajar malla');
   } catch (err) {
     console.error(err);
     setStatus('No se pudo relajar esta malla. Revisa la consola.');
@@ -1206,12 +1450,13 @@ async function reduceSelectedMesh() {
   const after = { vertices: Math.max(12, Math.floor(before.vertices * 0.65)), triangles: Math.max(12, Math.floor(before.triangles * 0.65)) };
   if (!confirmMeshOperation('Reducir malla', before, after, true)) return;
   try {
+    const guard = createMeshOperationGuard(rec);
     setMeshOperationBusy(true, 'Reduciendo malla en worker');
-    const next = await runMeshWorkerOperation('reduce', rec.mesh.geometry, { targetFraction: 0.65 });
-    replaceSelectedGeometry(next, 'Reducir malla');
+    const next = await runMeshWorkerOperation('reduce', guard.geometry, { targetFraction: 0.65 });
+    applyWorkerGeometryResult(guard, next, 'Reducir malla');
   } catch (err) {
     console.error(err);
-    setStatus('No se pudo reducir esta malla. Prueba primero con Remesh suave.');
+    setStatus('No se pudo reducir esta malla. Prueba primero con Subdividir + relajar.');
   } finally {
     setMeshOperationBusy(false);
   }
@@ -1228,7 +1473,7 @@ function updateDimensionInputs() {
 function applyDimensions(axisChanged = null) {
   const mesh = state.selected;
   if (!mesh) return;
-  pushObjectHistory('Cambiar dimensiones');
+  pushObjectMetaHistory('Cambiar dimensiones');
   mesh.geometry.computeBoundingBox();
   const box = mesh.geometry.boundingBox;
   const base = new THREE.Vector3();
@@ -1251,6 +1496,7 @@ function applyDimensions(axisChanged = null) {
     target.y / Math.max(base.y, 0.0001),
     target.z / Math.max(base.z, 0.0001)
   );
+  clampObjectScale(mesh);
   applySnapping();
   renderObjectList();
 }
@@ -1262,6 +1508,15 @@ function axisMaskFromTransformAxis(axis) {
     y: axis.includes('Y'),
     z: axis.includes('Z')
   };
+}
+
+function clampObjectScale(mesh) {
+  if (!mesh) return;
+  for (const axis of ['x', 'y', 'z']) {
+    const value = mesh.scale[axis];
+    if (!Number.isFinite(value)) mesh.scale[axis] = 1;
+    else if (Math.abs(value) < MIN_OBJECT_SCALE_ABS) mesh.scale[axis] = Math.sign(value || 1) * MIN_OBJECT_SCALE_ABS;
+  }
 }
 
 function constrainTransformToActiveAxes() {
@@ -1308,7 +1563,7 @@ function renderObjectList() {
     eye.textContent = rec.mesh.visible ? '◉' : '○';
     eye.addEventListener('click', (event) => {
       event.stopPropagation();
-      pushObjectHistory('Cambiar visibilidad', rec.mesh);
+      pushObjectMetaHistory('Cambiar visibilidad', rec.mesh);
       rec.mesh.visible = !rec.mesh.visible;
       setRecordWireframe(rec, state.wireframeEnabled);
       if (!rec.mesh.visible && state.selected === rec.mesh) setTransformModeFromTool();
@@ -1361,7 +1616,8 @@ function intersectObjects(event, objects = state.raycastTargets) {
   raycaster.setFromCamera(pointer, camera);
   // Los objetos de escena ya son meshes raíz; evitamos crear un array nuevo y
   // recorrer descendientes en cada pointermove.
-  const hits = raycaster.intersectObjects(objects, false);
+  const visibleObjects = objects.filter((object) => object?.visible !== false);
+  const hits = raycaster.intersectObjects(visibleObjects, false);
   return hits[0] || null;
 }
 
@@ -1489,55 +1745,19 @@ function pushStrokeHistory(label) {
     label,
     recordId: rec.id,
     kind: isPaint ? 'paint' : dynamicTopologyStroke ? 'geometryFull' : 'geometry',
+    // Cuando Dynamic Topology está activo el snapshot completo ya contiene
+    // posiciones/índices/UV/máscara. Evitamos duplicar esos buffers otra vez.
     objectSnapshotBefore: dynamicTopologyStroke ? serializeObject(rec, { includeTexture: false }) : null,
-    positionsBefore: !isPaint && position ? new Float32Array(position.array) : null,
-    indexBefore: !isPaint && geometry.getIndex() ? new Uint32Array(geometry.getIndex().array) : null,
-    uvBefore: !isPaint && geometry.getAttribute('uv') ? new Float32Array(geometry.getAttribute('uv').array) : null,
-    masksBefore: !isPaint && geometry.userData.maskWeights ? new Float32Array(geometry.userData.maskWeights) : null,
-    imageBefore: isPaint ? rec.textureSet.ctx.getImageData(0, 0, rec.textureSet.canvas.width, rec.textureSet.canvas.height) : null,
+    positionsBefore: !isPaint && !dynamicTopologyStroke && position ? new Float32Array(position.array) : null,
+    indexBefore: null,
+    uvBefore: null,
+    masksBefore: !isPaint && !dynamicTopologyStroke && geometry.userData.maskWeights ? new Float32Array(geometry.userData.maskWeights) : null,
+    // Para pintura capturamos solo tiles tocados, justo antes del primer sello
+    // que los modifica. Evita copiar 1024×1024 píxeles al iniciar cada trazo.
+    paintTiles: isPaint ? new Map() : null,
     dirtyBounds: null
   };
   state.strokeSnapshotDone = true;
-}
-
-function findChangedImageBounds(beforeData, afterData, width, height, candidate = null) {
-  const startX = candidate ? Math.max(0, Math.floor(candidate.x)) : 0;
-  const startY = candidate ? Math.max(0, Math.floor(candidate.y)) : 0;
-  const endX = candidate ? Math.min(width, Math.ceil(candidate.x + candidate.width)) : width;
-  const endY = candidate ? Math.min(height, Math.ceil(candidate.y + candidate.height)) : height;
-  let minX = endX;
-  let minY = endY;
-  let maxX = -1;
-  let maxY = -1;
-  for (let y = startY; y < endY; y++) {
-    const row = y * width * 4;
-    for (let x = startX; x < endX; x++) {
-      const i = row + x * 4;
-      if (
-        beforeData[i] !== afterData[i] ||
-        beforeData[i + 1] !== afterData[i + 1] ||
-        beforeData[i + 2] !== afterData[i + 2] ||
-        beforeData[i + 3] !== afterData[i + 3]
-      ) {
-        if (x < minX) minX = x;
-        if (y < minY) minY = y;
-        if (x > maxX) maxX = x;
-        if (y > maxY) maxY = y;
-      }
-    }
-  }
-  if (maxX < minX || maxY < minY) return null;
-  return { x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1 };
-}
-
-function extractImagePatch(data, fullWidth, bounds) {
-  const patch = new Uint8ClampedArray(bounds.width * bounds.height * 4);
-  for (let y = 0; y < bounds.height; y++) {
-    const srcStart = ((bounds.y + y) * fullWidth + bounds.x) * 4;
-    const srcEnd = srcStart + bounds.width * 4;
-    patch.set(data.subarray(srcStart, srcEnd), y * bounds.width * 4);
-  }
-  return patch;
 }
 
 function buildPositionDelta(before, after) {
@@ -1596,48 +1816,31 @@ function finalizeStrokeHistory() {
   let entry = null;
 
   if (stroke.kind === 'paint') {
-    const canvas = rec.textureSet.canvas;
     const ctx = rec.textureSet.ctx;
-    const after = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const bounds = findChangedImageBounds(
-      stroke.imageBefore.data,
-      after.data,
-      canvas.width,
-      canvas.height,
-      stroke.dirtyBounds
-    );
-    if (bounds) {
-      entry = {
-        kind: 'paintDelta',
-        label: stroke.label,
-        recordId: rec.id,
-        apply: 'before',
-        x: bounds.x,
-        y: bounds.y,
-        width: bounds.width,
-        height: bounds.height,
-        before: extractImagePatch(stroke.imageBefore.data, canvas.width, bounds),
-        after: extractImagePatch(after.data, canvas.width, bounds)
-      };
+    const tiles = [];
+    for (const snapshot of stroke.paintTiles?.values?.() || []) {
+      const after = ctx.getImageData(snapshot.x, snapshot.y, snapshot.width, snapshot.height).data;
+      let changed = false;
+      for (let i = 0; i < after.length; i++) {
+        if (snapshot.before[i] !== after[i]) { changed = true; break; }
+      }
+      if (!changed) continue;
+      tiles.push({
+        x: snapshot.x, y: snapshot.y, width: snapshot.width, height: snapshot.height,
+        before: snapshot.before,
+        after: new Uint8ClampedArray(after)
+      });
+    }
+    if (tiles.length) {
+      entry = { kind: 'paintTilesDelta', label: stroke.label, recordId: rec.id, apply: 'before', tiles };
     }
   } else {
     const geometry = rec.mesh.geometry;
     const position = geometry.getAttribute('position');
-    const index = geometry.getIndex();
-    const uv = geometry.getAttribute('uv');
-    const topologyChanged =
-      stroke.kind === 'geometryFull' && (
-        !position || !stroke.positionsBefore || position.array.length !== stroke.positionsBefore.length ||
-        (!!index !== !!stroke.indexBefore) ||
-        (index && stroke.indexBefore && index.array.length !== stroke.indexBefore.length) ||
-        (!!uv !== !!stroke.uvBefore) ||
-        (uv && stroke.uvBefore && uv.array.length !== stroke.uvBefore.length)
-      );
-
-    if (topologyChanged && stroke.objectSnapshotBefore) {
-      // Dynamic topology cambia el número de vértices/índices. En ese caso no
-      // es seguro aplicar un delta por vértice; guardamos un snapshot completo
-      // solo para esos trazos. El resto de trazos sigue usando deltas livianos.
+    if (stroke.kind === 'geometryFull' && stroke.objectSnapshotBefore) {
+      // Con Dynamic Topology guardamos una sola copia completa previa. Esto
+      // cubre tanto cambios de conectividad como el desplazamiento del pincel,
+      // sin duplicar buffers de posición/índice/UV dentro del mismo trazo.
       entry = {
         kind: 'object',
         label: stroke.label + ' + dynamic topology',
@@ -1661,6 +1864,7 @@ function finalizeStrokeHistory() {
   }
 
   if (!entry) return;
+  if (stroke.kind !== 'paint') bumpRecordGeometryVersion(rec);
   addHistoryEntry(entry, state.undo);
   trimUndoHistory();
   clearHistoryStack('redo');
@@ -1668,6 +1872,10 @@ function finalizeStrokeHistory() {
 }
 
 function applySculptAtEvent(event) {
+  if (state.meshWorkerBusy) {
+    setStatus('Espera a que termine la operación de malla antes de esculpir o editar la máscara.');
+    return;
+  }
   let mode = getActiveSculptMode(event);
   if (mode === 'transform') {
     setTool('move');
@@ -1721,10 +1929,14 @@ function applySculptAtEvent(event) {
   const previous = state.lastSculptHit && state.lastSculptHit.object === current.object ? state.lastSculptHit : null;
   const radius = getSculptWorldRadius(current);
 
-  // Dynamic Topology se evalúa una sola vez por evento físico del puntero.
-  // Los sellos interpolados y sus reflejos de simetría trabajan después sobre
-  // la misma topología, evitando varias reconstrucciones globales en un frame.
-  if (mode !== 'masking') applyDynamicTopologyIfNeeded(current.object, current, radius, mode);
+  // Dynamic Topology se evalúa una sola vez por evento físico del puntero,
+  // pero sobre la unión de la zona original y todas las regiones reflejadas.
+  // Así la densidad topológica permanece simétrica sin reconstruir la malla
+  // varias veces dentro del mismo frame.
+  if (mode !== 'masking') {
+    const topologyHits = getUniqueSymmetryVariants(current).map((variant) => variant.hit);
+    applyDynamicTopologyIfNeeded(current.object, topologyHits, radius, mode);
+  }
 
   // Move de SculptGL no funciona como una sucesión de sellos acumulativos:
   // congela un proxy al inicio y reubica ese proxy según el desplazamiento de pantalla.
@@ -1733,16 +1945,14 @@ function applySculptAtEvent(event) {
   let prevStamp = previous;
 
   for (const stamp of stamps) {
-    stamp.symmetryKey = 'base';
-    sculpt(stamp, prevStamp, mode, event);
-    for (const axes of getActiveSymmetryCombinations()) {
-      const mirrorHit = mirrorHitAcrossAxes(stamp, axes);
-      const mirrorPrev = prevStamp ? mirrorHitAcrossAxes(prevStamp, axes) : null;
-      if (mirrorHit) {
-        mirrorHit.symmetryKey = axes.join('');
-        if (mirrorPrev) mirrorPrev.symmetryKey = axes.join('');
-        sculpt(mirrorHit, mirrorPrev, mode, event);
-      }
+    for (const variant of getUniqueSymmetryVariants(stamp)) {
+      const variantHit = variant.hit;
+      const variantPrev = prevStamp
+        ? (variant.axes.length ? mirrorHitAcrossAxes(prevStamp, variant.axes) : prevStamp)
+        : null;
+      variantHit.symmetryKey = variant.key;
+      if (variantPrev) variantPrev.symmetryKey = variant.key;
+      sculpt(variantHit, variantPrev, mode, event);
     }
     prevStamp = stamp;
   }
@@ -1757,7 +1967,7 @@ function getActiveSculptMode(event = null) {
 }
 
 function isNegativeStroke(event = null) {
-  return !!(ui.negative?.checked || event?.altKey);
+  return !!ui.negative?.checked !== !!event?.altKey;
 }
 
 function getHitWorldNormal(hit) {
@@ -1809,6 +2019,33 @@ function getActiveSymmetryCombinations() {
     combos.push(combo);
   }
   return combos;
+}
+
+function getUniqueSymmetryVariants(hit) {
+  if (!hit?.object) return [];
+  const candidates = [{ hit, axes: [], key: 'base' }];
+  for (const axes of getActiveSymmetryCombinations()) {
+    const mirrored = mirrorHitAcrossAxes(hit, axes);
+    if (mirrored) candidates.push({ hit: mirrored, axes, key: axes.join('') });
+  }
+
+  // En los planos de simetría varios reflejos pueden coincidir exactamente.
+  // Deduplicamos en espacio local para que el pincel no duplique/triplique
+  // intensidad sobre X=0, Y=0, Z=0 o sus intersecciones.
+  const mesh = hit.object;
+  mesh.updateMatrixWorld(true);
+  const inverseWorld = mesh.matrixWorld.clone().invert();
+  const tolerance = 1e-6;
+  const seen = new Map();
+  const result = [];
+  for (const candidate of candidates) {
+    const local = candidate.hit.point.clone().applyMatrix4(inverseWorld);
+    const key = `${Math.round(local.x / tolerance)},${Math.round(local.y / tolerance)},${Math.round(local.z / tolerance)}`;
+    if (seen.has(key)) continue;
+    seen.set(key, true);
+    result.push(candidate);
+  }
+  return result;
 }
 
 function mirrorHitAcrossAxes(hit, axes = []) {
@@ -2223,7 +2460,17 @@ function fract(v) { return v - Math.floor(v); }
 
 function applyPaintAtEvent(event) {
   const hit = intersectObjects(event);
-  if (!hit || !hit.uv) return;
+  if (!hit) return;
+  if (!hit.uv) {
+    const rec = getRecord(hit.object);
+    const id = rec?.id ?? null;
+    if (state.lastNoUvWarningRecordId !== id) {
+      state.lastNoUvWarningRecordId = id;
+      setStatus('Este objeto no tiene coordenadas UV. Usa GLB/OBJ con UV o genera UV antes de pintar.');
+    }
+    return;
+  }
+  state.lastNoUvWarningRecordId = null;
   selectObject(hit.object);
   pushStrokeHistory('Trazo de textura');
 
@@ -2287,6 +2534,33 @@ function interpolateUvAcrossSeam(a, b, t) {
   );
 }
 
+function capturePaintHistoryTiles(rec, x, y, radius) {
+  const stroke = state.activeStrokeHistory;
+  if (!stroke || stroke.kind !== 'paint' || stroke.recordId !== rec.id || !stroke.paintTiles) return;
+  const { canvas, ctx } = rec.textureSet;
+  const x0 = Math.max(0, Math.floor(x - radius - 2));
+  const y0 = Math.max(0, Math.floor(y - radius - 2));
+  const x1 = Math.min(canvas.width, Math.ceil(x + radius + 2));
+  const y1 = Math.min(canvas.height, Math.ceil(y + radius + 2));
+  if (x1 <= x0 || y1 <= y0) return;
+  const tx0 = Math.floor(x0 / PAINT_HISTORY_TILE_SIZE);
+  const ty0 = Math.floor(y0 / PAINT_HISTORY_TILE_SIZE);
+  const tx1 = Math.floor((x1 - 1) / PAINT_HISTORY_TILE_SIZE);
+  const ty1 = Math.floor((y1 - 1) / PAINT_HISTORY_TILE_SIZE);
+  for (let ty = ty0; ty <= ty1; ty++) {
+    for (let tx = tx0; tx <= tx1; tx++) {
+      const key = `${tx}:${ty}`;
+      if (stroke.paintTiles.has(key)) continue;
+      const px = tx * PAINT_HISTORY_TILE_SIZE;
+      const py = ty * PAINT_HISTORY_TILE_SIZE;
+      const width = Math.min(PAINT_HISTORY_TILE_SIZE, canvas.width - px);
+      const height = Math.min(PAINT_HISTORY_TILE_SIZE, canvas.height - py);
+      const before = new Uint8ClampedArray(ctx.getImageData(px, py, width, height).data);
+      stroke.paintTiles.set(key, { x: px, y: py, width, height, before });
+    }
+  }
+}
+
 function markPaintDirtyBounds(recordId, x, y, radius, width, height) {
   const stroke = state.activeStrokeHistory;
   if (!stroke || stroke.kind !== 'paint' || stroke.recordId !== recordId) return;
@@ -2311,6 +2585,10 @@ function markPaintDirtyBounds(recordId, x, y, radius, width, height) {
 function paintAtHit(hit) {
   const rec = getRecord(hit.object);
   if (!rec || !hit.uv) return;
+  if (rec.materialPresetId) {
+    rec.materialPresetId = null;
+    syncMaterialPresetSelection(rec);
+  }
   const { canvas: texCanvas, ctx, texture } = rec.textureSet;
   const radius = parseFloat(ui.paintRadius.value);
   const opacity = parseFloat(ui.paintOpacity.value) * getPointerPressure(hit);
@@ -2320,6 +2598,7 @@ function paintAtHit(hit) {
 
   ctx.save();
   ctx.globalAlpha = opacity;
+  capturePaintHistoryTiles(rec, u, v, radius);
   drawPaintStamp(ctx, u, v, radius, color);
   markPaintDirtyBounds(rec.id, u, v, radius, texCanvas.width, texCanvas.height);
 
@@ -2327,10 +2606,12 @@ function paintAtHit(hit) {
   // del canvas. Así una esfera se comporta como un objeto cerrado, no como
   // una textura rectangular partida.
   if (u - radius < 0) {
+    capturePaintHistoryTiles(rec, u + texCanvas.width, v, radius);
     drawPaintStamp(ctx, u + texCanvas.width, v, radius, color);
     markPaintDirtyBounds(rec.id, 0, v, radius, texCanvas.width, texCanvas.height);
   }
   if (u + radius > texCanvas.width) {
+    capturePaintHistoryTiles(rec, u - texCanvas.width, v, radius);
     drawPaintStamp(ctx, u - texCanvas.width, v, radius, color);
     markPaintDirtyBounds(rec.id, texCanvas.width, v, radius, texCanvas.width, texCanvas.height);
   }
@@ -2459,7 +2740,7 @@ function duplicateSelected() {
   mesh.castShadow = true;
   // No recibe su propia sombra: así la superficie queda visualmente lisa, sin bandas.
   mesh.receiveShadow = false;
-  const newRec = { id: state.idCounter++, type: rec.type, mesh, textureSet: texSet, pbrMaterial: mesh.material, matcapMaterials: new Map(), createdAt: Date.now() };
+  const newRec = { id: state.idCounter++, type: rec.type, mesh, textureSet: texSet, pbrMaterial: mesh.material, matcapMaterials: new Map(), materialPresetId: rec.materialPresetId || null, createdAt: Date.now() };
   mesh.userData.recordId = newRec.id;
   state.objects.push(newRec);
   registerRecord(newRec);
@@ -2502,7 +2783,7 @@ function clearScene() {
 
 function centerSelected() {
   if (!state.selected) return;
-  pushObjectHistory('Centrar objeto');
+  pushObjectMetaHistory('Centrar objeto');
   const box = new THREE.Box3().setFromObject(state.selected);
   const center = box.getCenter(new THREE.Vector3());
   state.selected.position.x -= center.x;
@@ -2565,6 +2846,7 @@ function serializeObject(rec, options = {}) {
     textureData: null, // compatibilidad con proyectos guardados por versiones anteriores
     roughness: getPbrMaterial(rec).roughness,
     metalness: getPbrMaterial(rec).metalness,
+    materialPresetId: rec.materialPresetId || null,
     wireframe: state.wireframeEnabled
   };
 }
@@ -2584,6 +2866,38 @@ function pushObjectHistory(label = 'Cambio de objeto', mesh = state.selected, op
     label,
     recordId: rec.id,
     snapshot: serializeObject(rec, options)
+  });
+}
+
+function serializeObjectMeta(rec) {
+  return {
+    id: rec.id,
+    name: rec.mesh.name,
+    visible: rec.mesh.visible,
+    position: rec.mesh.position.toArray(),
+    rotation: [rec.mesh.rotation.x, rec.mesh.rotation.y, rec.mesh.rotation.z],
+    scale: rec.mesh.scale.toArray(),
+    roughness: getPbrMaterial(rec).roughness,
+    metalness: getPbrMaterial(rec).metalness,
+    materialPresetId: rec.materialPresetId || null
+  };
+}
+
+function pushObjectMetaHistory(label = 'Cambio de objeto', mesh = state.selected) {
+  const rec = getRecord(mesh);
+  if (!rec) return;
+  commitHistoryEntry({ kind: 'objectMeta', label, recordId: rec.id, snapshot: serializeObjectMeta(rec) });
+}
+
+function pushMaskHistory(label = 'Cambio de máscara', mesh = state.selected) {
+  const rec = getRecord(mesh);
+  if (!rec) return;
+  ensureMaskData(rec.mesh.geometry);
+  commitHistoryEntry({
+    kind: 'maskFull',
+    label,
+    recordId: rec.id,
+    values: new Float32Array(rec.mesh.geometry.userData.maskWeights)
   });
 }
 
@@ -2671,7 +2985,7 @@ async function createRecordFromSnapshot(data) {
   mesh.castShadow = true;
   mesh.receiveShadow = false;
   mesh.userData.recordId = data.id;
-  const rec = { id: data.id, type: data.type, mesh, textureSet: texSet, pbrMaterial: mesh.material, matcapMaterials: new Map(), createdAt: Date.now() };
+  const rec = { id: data.id, type: data.type, mesh, textureSet: texSet, pbrMaterial: mesh.material, matcapMaterials: new Map(), materialPresetId: data.materialPresetId || null, createdAt: Date.now() };
   scene.add(mesh);
   const insertAt = Number.isInteger(data.orderIndex)
     ? THREE.MathUtils.clamp(data.orderIndex, 0, state.objects.length)
@@ -2706,11 +3020,46 @@ async function restoreObjectSnapshot(data) {
   const pbr = getPbrMaterial(rec);
   pbr.roughness = data.roughness ?? pbr.roughness;
   pbr.metalness = data.metalness ?? pbr.metalness;
+  rec.materialPresetId = data.materialPresetId || null;
   pbr.wireframe = false;
   pbr.needsUpdate = true;
   applyViewMaterialToRecord(rec);
   setRecordWireframe(rec, state.wireframeEnabled);
   if (data.texture || data.textureData) await restoreTextureSnapshot(data, rec.textureSet);
+  selectObject(rec.mesh);
+  updateInspector();
+  renderObjectList();
+}
+
+function restoreObjectMeta(snapshot) {
+  const rec = state.recordsById.get(snapshot?.id);
+  if (!rec) return;
+  rec.mesh.name = snapshot.name ?? rec.mesh.name;
+  rec.mesh.visible = snapshot.visible !== false;
+  if (snapshot.position) rec.mesh.position.fromArray(snapshot.position);
+  if (snapshot.rotation) rec.mesh.rotation.set(snapshot.rotation[0], snapshot.rotation[1], snapshot.rotation[2]);
+  if (snapshot.scale) rec.mesh.scale.fromArray(snapshot.scale);
+  const pbr = getPbrMaterial(rec);
+  if (Number.isFinite(snapshot.roughness)) pbr.roughness = snapshot.roughness;
+  if (Number.isFinite(snapshot.metalness)) pbr.metalness = snapshot.metalness;
+  rec.materialPresetId = snapshot.materialPresetId || null;
+  pbr.needsUpdate = true;
+  applyViewMaterialToRecord(rec);
+  setRecordWireframe(rec, state.wireframeEnabled);
+  selectObject(rec.mesh);
+  updateInspector();
+  renderObjectList();
+}
+
+function restoreMaskFull(entry) {
+  const rec = state.recordsById.get(entry?.recordId);
+  if (!rec || !entry.values) return;
+  ensureMaskData(rec.mesh.geometry);
+  const mask = rec.mesh.geometry.userData.maskWeights;
+  if (mask.length !== entry.values.length) return;
+  mask.set(entry.values);
+  updateMaskColors(rec.mesh.geometry);
+  bumpRecordGeometryVersion(rec);
   selectObject(rec.mesh);
   updateInspector();
   renderObjectList();
@@ -2786,6 +3135,7 @@ function applyGeometryDelta(entry) {
   geometry.computeBoundingSphere();
   markSpatialIndexStale(geometry);
   rebuildCurrentSpatialIndexIfNeeded(geometry);
+  bumpRecordGeometryVersion(rec);
   markWireframeDirty(rec.mesh);
   selectObject(rec.mesh);
   updateInspector();
@@ -2804,9 +3154,34 @@ function applyPaintDelta(entry) {
   renderObjectList();
 }
 
+function applyPaintTilesDelta(entry) {
+  const rec = state.recordsById.get(entry.recordId);
+  if (!rec) return;
+  const target = entry.apply === 'after' ? 'after' : 'before';
+  for (const tile of entry.tiles || []) {
+    const source = tile[target];
+    if (!source) continue;
+    rec.textureSet.ctx.putImageData(new ImageData(new Uint8ClampedArray(source), tile.width, tile.height), tile.x, tile.y);
+  }
+  rec.textureSet.texture.needsUpdate = true;
+  selectObject(rec.mesh);
+  updateInspector();
+  renderObjectList();
+}
+
 function captureCurrentEntryFor(entry) {
-  if (entry.kind === 'geometryDelta' || entry.kind === 'paintDelta') {
+  if (entry.kind === 'geometryDelta' || entry.kind === 'paintDelta' || entry.kind === 'paintTilesDelta') {
     return { ...entry, apply: entry.apply === 'before' ? 'after' : 'before' };
+  }
+  if (entry.kind === 'objectMeta') {
+    const rec = state.recordsById.get(entry.recordId);
+    return rec ? { kind: 'objectMeta', label: entry.label, recordId: rec.id, snapshot: serializeObjectMeta(rec) } : null;
+  }
+  if (entry.kind === 'maskFull') {
+    const rec = state.recordsById.get(entry.recordId);
+    if (!rec) return null;
+    ensureMaskData(rec.mesh.geometry);
+    return { kind: 'maskFull', label: entry.label, recordId: rec.id, values: new Float32Array(rec.mesh.geometry.userData.maskWeights) };
   }
   if (entry.kind === 'object') {
     const rec = state.recordsById.get(entry.recordId);
@@ -2840,12 +3215,16 @@ async function restoreHistoryEntry(entry) {
   if (!entry) return;
   if (entry.kind === 'geometryDelta') applyGeometryDelta(entry);
   else if (entry.kind === 'paintDelta') applyPaintDelta(entry);
+  else if (entry.kind === 'paintTilesDelta') applyPaintTilesDelta(entry);
+  else if (entry.kind === 'objectMeta') restoreObjectMeta(entry.snapshot);
+  else if (entry.kind === 'maskFull') restoreMaskFull(entry);
   else if (entry.kind === 'object') await restoreObjectSnapshot(entry.snapshot);
   else if (entry.kind === 'objectBatch') await restoreObjectBatch(entry);
   else await restoreScene(entry.snapshot, false);
 }
 
 async function undo() {
+  if (state.meshWorkerBusy) { setStatus('Espera a que termine la operación de malla antes de deshacer.'); return; }
   if (!state.undo.length) return;
   const entry = state.undo.pop();
   state.undoBytes -= entry?.bytes || 0;
@@ -2857,6 +3236,7 @@ async function undo() {
 }
 
 async function redo() {
+  if (state.meshWorkerBusy) { setStatus('Espera a que termine la operación de malla antes de rehacer.'); return; }
   if (!state.redo.length) return;
   const entry = state.redo.pop();
   state.redoBytes -= entry?.bytes || 0;
@@ -2869,8 +3249,8 @@ async function redo() {
 }
 
 function updateHistoryButtons() {
-  $('undoBtn').disabled = state.undo.length === 0;
-  $('redoBtn').disabled = state.redo.length === 0;
+  $('undoBtn').disabled = state.meshWorkerBusy || state.undo.length === 0;
+  $('redoBtn').disabled = state.meshWorkerBusy || state.redo.length === 0;
 }
 
 function drawDataUrlToCanvas(dataUrl, texCanvas, ctx) {
@@ -2889,13 +3269,30 @@ function drawDataUrlToCanvas(dataUrl, texCanvas, ctx) {
 function loadTextureFile(file) {
   const rec = getRecord();
   if (!rec || !file) return;
-  pushObjectHistory('Cargar textura', state.selected, { includeTexture: true });
+  if (!file.type.startsWith('image/')) {
+    setStatus('El archivo seleccionado no es una imagen compatible.');
+    return;
+  }
+  if (file.size > MAX_TEXTURE_FILE_BYTES) {
+    setStatus(`Textura rechazada: ${(file.size / 1024 / 1024).toFixed(1)} MB exceden el límite de 20 MB.`);
+    return;
+  }
   const img = new Image();
   const objectUrl = URL.createObjectURL(file);
   img.onload = () => {
+    const naturalWidth = img.naturalWidth || img.width;
+    const naturalHeight = img.naturalHeight || img.height;
+    if (naturalWidth * naturalHeight > MAX_IMAGE_PIXELS) {
+      URL.revokeObjectURL(objectUrl);
+      setStatus(`Textura rechazada: ${naturalWidth}×${naturalHeight} px exceden el límite de resolución.`);
+      return;
+    }
+    pushObjectHistory('Cargar textura', rec.mesh, { includeTexture: true });
     rec.textureSet.ctx.clearRect(0, 0, rec.textureSet.canvas.width, rec.textureSet.canvas.height);
     rec.textureSet.ctx.drawImage(img, 0, 0, rec.textureSet.canvas.width, rec.textureSet.canvas.height);
     rec.textureSet.texture.needsUpdate = true;
+    rec.materialPresetId = null;
+    syncMaterialPresetSelection(rec);
     URL.revokeObjectURL(objectUrl);
     setStatus(`Textura cargada: ${file.name}`);
   };
@@ -2914,32 +3311,39 @@ function clearTexture() {
   ctx.fillStyle = ui.baseColor.value;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   texture.needsUpdate = true;
+  rec.materialPresetId = null;
+  syncMaterialPresetSelection(rec);
 }
 
 function clearMask() {
   const mesh = state.selected;
   if (!mesh) return;
-  pushObjectHistory('Limpiar máscara');
+  if (state.meshWorkerBusy) { setStatus('Espera a que termine la operación de malla.'); return; }
+  pushMaskHistory('Limpiar máscara');
   const mask = ensureMaskData(mesh.geometry);
   mask.fill(1);
   updateMaskColors(mesh.geometry);
+  bumpRecordGeometryVersion(getRecord(mesh));
   setStatus('Máscara limpiada');
 }
 
 function invertMask() {
   const mesh = state.selected;
   if (!mesh) return;
-  pushObjectHistory('Invertir máscara');
+  if (state.meshWorkerBusy) { setStatus('Espera a que termine la operación de malla.'); return; }
+  pushMaskHistory('Invertir máscara');
   const mask = ensureMaskData(mesh.geometry);
   for (let i = 0; i < mask.length; i++) mask[i] = 1 - mask[i];
   updateMaskColors(mesh.geometry);
+  bumpRecordGeometryVersion(getRecord(mesh));
   setStatus('Máscara invertida');
 }
 
 function blurMask() {
   const mesh = state.selected;
   if (!mesh) return;
-  pushObjectHistory('Difuminar máscara');
+  if (state.meshWorkerBusy) { setStatus('Espera a que termine la operación de malla.'); return; }
+  pushMaskHistory('Difuminar máscara');
   const geometry = mesh.geometry;
   const mask = ensureMaskData(geometry);
   const topology = getSculptTopology(geometry);
@@ -2957,6 +3361,7 @@ function blurMask() {
   }
   geometry.userData.maskWeights = next;
   updateMaskColors(geometry);
+  bumpRecordGeometryVersion(getRecord(mesh));
   setStatus('Máscara suavizada');
 }
 
@@ -2966,7 +3371,7 @@ function updateMaterial() {
   if (!mesh || !rec) return;
   const pbr = getPbrMaterial(rec);
   pbr.metalness = parseFloat(ui.metalness.value);
-  pbr.roughness = parseFloat(ui.roughness.value);
+  pbr.roughness = 1 - THREE.MathUtils.clamp(parseFloat(ui.roughness.value), 0, 1);
   pbr.needsUpdate = true;
   if (state.viewMode === 'pbr') mesh.material = pbr;
 }
@@ -2980,6 +3385,8 @@ function applyBaseColor() {
   ctx.fillStyle = ui.baseColor.value;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   texture.needsUpdate = true;
+  rec.materialPresetId = null;
+  syncMaterialPresetSelection(rec);
 }
 
 function saveTexture() {
@@ -3009,13 +3416,99 @@ function exportGLB() {
   }, (err) => console.error(err), { binary: true, embedImages: true, includeCustomExtensions: false });
 }
 
+function inspectMeshForManufacturing(mesh) {
+  const geometry = mesh?.geometry;
+  const position = geometry?.getAttribute?.('position');
+  if (!position || position.count < 3) return { triangles: 0, boundaryEdges: 0, nonManifoldEdges: 0, degenerateTriangles: 0 };
+  mesh.updateMatrixWorld(true);
+  geometry.computeBoundingBox();
+  const localBox = geometry.boundingBox?.clone();
+  const worldBox = localBox ? localBox.applyMatrix4(mesh.matrixWorld) : null;
+  const diag = worldBox ? worldBox.min.distanceTo(worldBox.max) : 1;
+  const epsilon = Math.max(1e-8, diag * 1e-6);
+  const inv = 1 / epsilon;
+  const vertexToGroup = new Uint32Array(position.count);
+  const groups = new Map();
+  const worldPositions = new Float64Array(position.count * 3);
+  let nextGroup = 0;
+  for (let i = 0; i < position.count; i++) {
+    tmpV.set(position.getX(i), position.getY(i), position.getZ(i)).applyMatrix4(mesh.matrixWorld);
+    const k = i * 3;
+    worldPositions[k] = tmpV.x; worldPositions[k + 1] = tmpV.y; worldPositions[k + 2] = tmpV.z;
+    const key = `${Math.round(tmpV.x * inv)},${Math.round(tmpV.y * inv)},${Math.round(tmpV.z * inv)}`;
+    let group = groups.get(key);
+    if (group === undefined) { group = nextGroup++; groups.set(key, group); }
+    vertexToGroup[i] = group;
+  }
+
+  const index = geometry.getIndex();
+  const triangleCount = index ? Math.floor(index.count / 3) : Math.floor(position.count / 3);
+  const edgeCounts = new Map();
+  let degenerateTriangles = 0;
+  const edgeKey = (a, b) => a < b ? `${a}:${b}` : `${b}:${a}`;
+  const addEdge = (a, b) => {
+    if (a === b) return;
+    const key = edgeKey(a, b);
+    edgeCounts.set(key, (edgeCounts.get(key) || 0) + 1);
+  };
+  const readIndex = (i) => index ? index.getX(i) : i;
+
+  for (let tri = 0; tri < triangleCount; tri++) {
+    const a = readIndex(tri * 3), b = readIndex(tri * 3 + 1), c = readIndex(tri * 3 + 2);
+    const ga = vertexToGroup[a], gb = vertexToGroup[b], gc = vertexToGroup[c];
+    if (ga === gb || gb === gc || gc === ga) { degenerateTriangles++; continue; }
+    const ak = a * 3, bk = b * 3, ck = c * 3;
+    const abx = worldPositions[bk] - worldPositions[ak];
+    const aby = worldPositions[bk + 1] - worldPositions[ak + 1];
+    const abz = worldPositions[bk + 2] - worldPositions[ak + 2];
+    const acx = worldPositions[ck] - worldPositions[ak];
+    const acy = worldPositions[ck + 1] - worldPositions[ak + 1];
+    const acz = worldPositions[ck + 2] - worldPositions[ak + 2];
+    const nx = aby * acz - abz * acy;
+    const ny = abz * acx - abx * acz;
+    const nz = abx * acy - aby * acx;
+    if (nx * nx + ny * ny + nz * nz <= Math.pow(epsilon, 4)) degenerateTriangles++;
+    addEdge(ga, gb); addEdge(gb, gc); addEdge(gc, ga);
+  }
+
+  let boundaryEdges = 0, nonManifoldEdges = 0;
+  for (const count of edgeCounts.values()) {
+    if (count === 1) boundaryEdges++;
+    else if (count > 2) nonManifoldEdges++;
+  }
+  return { triangles: triangleCount, boundaryEdges, nonManifoldEdges, degenerateTriangles };
+}
+
+function confirmManufacturingIssues(records) {
+  const issues = [];
+  for (const rec of records) {
+    const report = inspectMeshForManufacturing(rec.mesh);
+    if (!report.boundaryEdges && !report.nonManifoldEdges && !report.degenerateTriangles) continue;
+    const details = [];
+    if (report.boundaryEdges) details.push(`${report.boundaryEdges.toLocaleString()} borde(s) abierto(s)`);
+    if (report.nonManifoldEdges) details.push(`${report.nonManifoldEdges.toLocaleString()} borde(s) no-manifold`);
+    if (report.degenerateTriangles) details.push(`${report.degenerateTriangles.toLocaleString()} triángulo(s) degenerado(s)`);
+    issues.push(`${rec.mesh.name}: ${details.join(', ')}`);
+  }
+  if (!issues.length) return true;
+  return window.confirm(
+    `Comprobación básica de STL:
+
+${issues.slice(0, 6).join('
+')}${issues.length > 6 ? `
+…y ${issues.length - 6} objeto(s) más.` : ''}
+
+La comprobación detectó problemas básicos de topología. No verifica autointersecciones ni grosor mínimo. ¿Exportar de todos modos?`
+  );
+}
+
 function exportSTL(selectedOnly = false) {
   if (selectedOnly && !state.selected) {
     setStatus('Selecciona un objeto antes de exportar STL seleccionado');
     return;
   }
 
-  const records = getExportRecords({ selectedOnly, includeHidden: !selectedOnly });
+  const records = getExportRecords({ selectedOnly, includeHidden: false });
   if (!records.length) {
     setStatus('No hay geometría para exportar STL');
     return;
@@ -3026,10 +3519,14 @@ function exportSTL(selectedOnly = false) {
     const ok = window.confirm(`El STL tendrá aproximadamente ${triangles.toLocaleString()} triángulos. Puede tardar y generar un archivo pesado. ¿Continuar?`);
     if (!ok) return;
   }
+  if (!confirmManufacturingIssues(records)) {
+    setStatus('Exportación STL cancelada por validación de fabricación');
+    return;
+  }
 
   const exporter = new STLExporter();
   const binary = (ui.stlFormat?.value || 'binary') === 'binary';
-  const group = exportGroup({ selectedOnly, includeHidden: !selectedOnly, keepMaterialMap: false, stlSafe: true });
+  const group = exportGroup({ selectedOnly, includeHidden: false, keepMaterialMap: false, stlSafe: true });
   const result = exporter.parse(group, { binary });
   const baseName = selectedOnly && state.selected ? state.selected.name.replace(/\s+/g, '_') : 'sculptcad_pro_scene';
 
@@ -3156,6 +3653,50 @@ function applyWireframeToScene(enabled) {
   setStatus(enabled ? 'Wireframe activado: mallado superpuesto sobre el objeto' : 'Wireframe desactivado');
 }
 
+function getVectorWorker() {
+  if (vectorWorker) return vectorWorker;
+  vectorWorker = new Worker(new URL('./workers/vectorWorker.js', import.meta.url), { type: 'module' });
+  vectorWorker.onmessage = (event) => {
+    const { id, ok, result, error } = event.data || {};
+    const job = vectorWorkerJobs.get(id);
+    if (!job) return;
+    vectorWorkerJobs.delete(id);
+    if (ok) job.resolve(result);
+    else job.reject(new Error(error || 'Error desconocido en vectorizador'));
+  };
+  vectorWorker.onerror = (error) => {
+    for (const [, job] of vectorWorkerJobs) job.reject(error instanceof Error ? error : new Error(error.message || 'Error en vectorizador'));
+    vectorWorkerJobs.clear();
+    vectorWorker?.terminate?.();
+    vectorWorker = null;
+  };
+  return vectorWorker;
+}
+
+function runVectorWorker(options) {
+  if (!rasterVectorState.sourcePixels || !rasterVectorState.width || !rasterVectorState.height) {
+    return Promise.resolve(null);
+  }
+  const id = vectorWorkerSeq++;
+  const pixels = new Uint8ClampedArray(rasterVectorState.sourcePixels);
+  const worker = getVectorWorker();
+  return new Promise((resolve, reject) => {
+    vectorWorkerJobs.set(id, { resolve, reject });
+    worker.postMessage({
+      id,
+      pixels,
+      width: rasterVectorState.width,
+      height: rasterVectorState.height,
+      options
+    }, [pixels.buffer]);
+  });
+}
+
+function scheduleRasterVectorRefresh(delay = 90) {
+  window.clearTimeout(vectorRefreshTimer);
+  vectorRefreshTimer = window.setTimeout(() => refreshRasterVectorFromControls(), delay);
+}
+
 function updateShapeInfo(message, isError = false) {
   if (!ui.shapeInfo) return;
   ui.shapeInfo.textContent = message;
@@ -3228,131 +3769,6 @@ function updateShapePreviewBinary(mask, width, height) {
   renderFittedCanvas(ui.shapeBinaryPreview, canvas);
 }
 
-function simplifyLoopPoints(loop) {
-  if (!Array.isArray(loop) || loop.length < 4) return loop || [];
-  const cleaned = [];
-  for (const point of loop) {
-    const prev = cleaned[cleaned.length - 1];
-    if (!prev || prev.x !== point.x || prev.y !== point.y) cleaned.push(point);
-  }
-  if (cleaned.length > 1) {
-    const first = cleaned[0];
-    const last = cleaned[cleaned.length - 1];
-    if (first.x === last.x && first.y === last.y) cleaned.pop();
-  }
-  if (cleaned.length < 3) return cleaned;
-  let changed = true;
-  while (changed && cleaned.length >= 3) {
-    changed = false;
-    for (let i = 0; i < cleaned.length; i++) {
-      const a = cleaned[(i - 1 + cleaned.length) % cleaned.length];
-      const b = cleaned[i];
-      const c = cleaned[(i + 1) % cleaned.length];
-      const collinear = (a.x === b.x && b.x === c.x) || (a.y === b.y && b.y === c.y);
-      if (collinear) {
-        cleaned.splice(i, 1);
-        changed = true;
-        break;
-      }
-    }
-  }
-  return cleaned;
-}
-
-function removeSmallMaskComponents(mask, width, height, minArea = 0) {
-  if (!mask || minArea <= 1) return mask;
-  const next = new Uint8Array(mask);
-  const visited = new Uint8Array(mask.length);
-  const neighbors = [[1, 0], [-1, 0], [0, 1], [0, -1]];
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const start = y * width + x;
-      if (!next[start] || visited[start]) continue;
-      const queue = [start];
-      const component = [];
-      visited[start] = 1;
-      while (queue.length) {
-        const idx = queue.pop();
-        component.push(idx);
-        const cx = idx % width;
-        const cy = Math.floor(idx / width);
-        for (const [dx, dy] of neighbors) {
-          const nx = cx + dx;
-          const ny = cy + dy;
-          if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-          const ni = ny * width + nx;
-          if (!next[ni] || visited[ni]) continue;
-          visited[ni] = 1;
-          queue.push(ni);
-        }
-      }
-      if (component.length < minArea) {
-        for (const idx of component) next[idx] = 0;
-      }
-    }
-  }
-  return next;
-}
-
-function traceMaskLoops(mask, width, height) {
-  const startMap = new Map();
-  const edges = [];
-  const addEdge = (x1, y1, x2, y2) => {
-    const edge = { start: { x: x1, y: y1 }, end: { x: x2, y: y2 }, used: false };
-    edges.push(edge);
-    const key = `${x1},${y1}`;
-    const list = startMap.get(key) || [];
-    list.push(edge);
-    startMap.set(key, list);
-  };
-  const filled = (x, y) => x >= 0 && y >= 0 && x < width && y < height && !!mask[y * width + x];
-
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      if (!filled(x, y)) continue;
-      if (!filled(x, y - 1)) addEdge(x, y, x + 1, y);
-      if (!filled(x + 1, y)) addEdge(x + 1, y, x + 1, y + 1);
-      if (!filled(x, y + 1)) addEdge(x + 1, y + 1, x, y + 1);
-      if (!filled(x - 1, y)) addEdge(x, y + 1, x, y);
-    }
-  }
-
-  const dirKey = (dx, dy) => `${dx},${dy}`;
-  const directionOrder = ['1,0', '0,1', '-1,0', '0,-1'];
-  const chooseNextEdge = (candidates, previous) => {
-    if (!candidates?.length) return null;
-    if (candidates.length === 1 || !previous) return candidates.find((edge) => !edge.used) || null;
-    const prevDir = dirKey(previous.end.x - previous.start.x, previous.end.y - previous.start.y);
-    const prevIndex = directionOrder.indexOf(prevDir);
-    const preference = [1, 0, 3, 2].map((delta) => directionOrder[(prevIndex + delta + 4) % 4]);
-    for (const key of preference) {
-      const edge = candidates.find((candidate) => !candidate.used && dirKey(candidate.end.x - candidate.start.x, candidate.end.y - candidate.start.y) === key);
-      if (edge) return edge;
-    }
-    return candidates.find((edge) => !edge.used) || null;
-  };
-
-  const loops = [];
-  for (const edge of edges) {
-    if (edge.used) continue;
-    const loop = [{ x: edge.start.x, y: edge.start.y }];
-    let current = edge;
-    let guard = 0;
-    while (current && !current.used && guard < edges.length + 10) {
-      current.used = true;
-      loop.push({ x: current.end.x, y: current.end.y });
-      const start = loop[0];
-      const end = current.end;
-      if (end.x === start.x && end.y === start.y) break;
-      current = chooseNextEdge(startMap.get(`${end.x},${end.y}`), current);
-      guard++;
-    }
-    const simplified = simplifyLoopPoints(loop);
-    if (simplified.length >= 3) loops.push(simplified);
-  }
-  return loops;
-}
-
 function loopSignedArea(loop) {
   let area = 0;
   for (let i = 0; i < loop.length; i++) {
@@ -3379,146 +3795,6 @@ function averagePoint(points) {
   const result = new THREE.Vector2();
   for (const point of points) result.add(point);
   return result.multiplyScalar(1 / Math.max(1, points.length));
-}
-
-function pointLineDistance(point, start, end) {
-  const dx = end.x - start.x;
-  const dy = end.y - start.y;
-  if (dx === 0 && dy === 0) return Math.hypot(point.x - start.x, point.y - start.y);
-  const t = Math.max(0, Math.min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / (dx * dx + dy * dy)));
-  const projX = start.x + t * dx;
-  const projY = start.y + t * dy;
-  return Math.hypot(point.x - projX, point.y - projY);
-}
-
-function simplifyOpenPolyline(points, epsilon) {
-  if (!Array.isArray(points) || points.length <= 2 || epsilon <= 0) return points ? points.slice() : [];
-  let maxDistance = 0;
-  let index = -1;
-  const first = points[0];
-  const last = points[points.length - 1];
-  for (let i = 1; i < points.length - 1; i++) {
-    const distance = pointLineDistance(points[i], first, last);
-    if (distance > maxDistance) {
-      maxDistance = distance;
-      index = i;
-    }
-  }
-  if (maxDistance > epsilon && index !== -1) {
-    const left = simplifyOpenPolyline(points.slice(0, index + 1), epsilon);
-    const right = simplifyOpenPolyline(points.slice(index), epsilon);
-    return left.slice(0, -1).concat(right);
-  }
-  return [first, last];
-}
-
-function simplifyClosedLoopRDP(points, epsilon) {
-  if (!Array.isArray(points) || points.length <= 3 || epsilon <= 0) return points ? points.slice() : [];
-  const open = points.concat([points[0]]);
-  const simplified = simplifyOpenPolyline(open, epsilon);
-  if (simplified.length > 1) simplified.pop();
-  return simplifyLoopPoints(simplified);
-}
-
-function chaikinSmoothLoop(points, iterations = 0) {
-  let current = points ? points.slice() : [];
-  for (let iter = 0; iter < iterations; iter++) {
-    if (current.length < 3) break;
-    const next = [];
-    for (let i = 0; i < current.length; i++) {
-      const a = current[i];
-      const b = current[(i + 1) % current.length];
-      next.push({ x: 0.75 * a.x + 0.25 * b.x, y: 0.75 * a.y + 0.25 * b.y });
-      next.push({ x: 0.25 * a.x + 0.75 * b.x, y: 0.25 * a.y + 0.75 * b.y });
-    }
-    current = next;
-  }
-  return current;
-}
-
-function loopPerimeter(loop) {
-  let total = 0;
-  for (let i = 0; i < loop.length; i++) {
-    const a = loop[i];
-    const b = loop[(i + 1) % loop.length];
-    total += Math.hypot(b.x - a.x, b.y - a.y);
-  }
-  return total;
-}
-
-function resampleLoop(loop, segmentLength = 3) {
-  if (!Array.isArray(loop) || loop.length < 3 || segmentLength <= 0) return loop ? loop.slice() : [];
-  const perimeter = loopPerimeter(loop);
-  if (perimeter <= 0) return loop.slice();
-  const count = Math.max(12, Math.min(600, Math.round(perimeter / segmentLength)));
-  const cumulative = [0];
-  for (let i = 0; i < loop.length; i++) {
-    const a = loop[i];
-    const b = loop[(i + 1) % loop.length];
-    cumulative.push(cumulative[cumulative.length - 1] + Math.hypot(b.x - a.x, b.y - a.y));
-  }
-  const total = cumulative[cumulative.length - 1];
-  const samples = [];
-  for (let s = 0; s < count; s++) {
-    const target = (s / count) * total;
-    let edgeIndex = 0;
-    while (edgeIndex < loop.length && cumulative[edgeIndex + 1] < target) edgeIndex++;
-    const edgeStart = cumulative[edgeIndex];
-    const edgeEnd = cumulative[edgeIndex + 1];
-    const a = loop[edgeIndex % loop.length];
-    const b = loop[(edgeIndex + 1) % loop.length];
-    const t = edgeEnd > edgeStart ? (target - edgeStart) / (edgeEnd - edgeStart) : 0;
-    samples.push({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
-  }
-  return samples;
-}
-
-function processRasterLoops(rawLoops, width, height) {
-  if (!rawLoops?.length) return [];
-  const simplifyAmount = Number(ui.shapeSimplify?.value || 0) / 100;
-  const smoothAmount = Number(ui.shapeSmoothness?.value || 0) / 100;
-  const minDimension = Math.max(1, Math.min(width, height));
-  const epsilon = simplifyAmount * (minDimension * 0.05);
-  const resampleStep = THREE.MathUtils.lerp(1.2, 4.5, smoothAmount);
-  const smoothIterations = Math.max(0, Math.round(smoothAmount * 4));
-
-  return rawLoops.map((loop) => {
-    let next = simplifyLoopPoints(loop);
-    if (epsilon > 0.01) next = simplifyClosedLoopRDP(next, epsilon);
-    if (smoothAmount > 0.001) {
-      next = resampleLoop(next, resampleStep);
-      next = chaikinSmoothLoop(next, smoothIterations);
-      if (epsilon > 0.01) next = simplifyClosedLoopRDP(next, epsilon * 0.45);
-    }
-    return simplifyLoopPoints(next);
-  }).filter((loop) => loop.length >= 3 && Math.abs(loopSignedArea(loop)) >= 1);
-}
-
-function smoothMask(mask, width, height, strength = 0) {
-  const passes = Math.max(0, Math.round((strength / 100) * 3));
-  if (!mask || passes <= 0) return mask;
-  let current = new Uint8Array(mask);
-  for (let pass = 0; pass < passes; pass++) {
-    const next = new Uint8Array(current.length);
-    for (let y = 0; y < height; y++) {
-      for (let x = 0; x < width; x++) {
-        let sum = 0;
-        let samples = 0;
-        for (let oy = -1; oy <= 1; oy++) {
-          for (let ox = -1; ox <= 1; ox++) {
-            const nx = x + ox;
-            const ny = y + oy;
-            if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-            sum += current[ny * width + nx];
-            samples++;
-          }
-        }
-        next[y * width + x] = sum >= Math.ceil(samples * 0.5) ? 1 : 0;
-      }
-    }
-    current = next;
-  }
-  return current;
 }
 
 function rasterLoopsToSvg(loops, width, height) {
@@ -3575,8 +3851,8 @@ function syncShapeAspect(changed = 'width') {
   }
 }
 
-function refreshRasterVectorFromControls() {
-  if (!rasterVectorState.sourceCanvas.width || !rasterVectorState.sourceCanvas.height) {
+async function refreshRasterVectorFromControls() {
+  if (!rasterVectorState.sourcePixels || !rasterVectorState.width || !rasterVectorState.height) {
     updateShapeInfo('Carga una silueta en blanco y negro para generar el contorno vectorial.');
     clearPreviewCanvas(ui.shapeBinaryPreview, 'Silueta');
     clearPreviewCanvas(ui.shapeVectorPreview, 'Vector');
@@ -3590,54 +3866,56 @@ function refreshRasterVectorFromControls() {
     return;
   }
 
-  const { width, height } = rasterVectorState.sourceCanvas;
-  const image = rasterVectorState.sourceCtx.getImageData(0, 0, width, height);
-  const mask = new Uint8Array(width * height);
-  const threshold = Number(ui.shapeThreshold?.value || 128);
-  const invert = !!ui.shapeInvert?.checked;
-  const noiseArea = Number(ui.shapeNoiseArea?.value || 0);
+  const generation = ++rasterVectorState.vectorGeneration;
   const smoothStrength = Number(ui.shapeSmoothness?.value || 0);
+  updateShapeInfo('Procesando vector…');
+  try {
+    const result = await runVectorWorker({
+      threshold: Number(ui.shapeThreshold?.value || 128),
+      invert: !!ui.shapeInvert?.checked,
+      noiseArea: Number(ui.shapeNoiseArea?.value || 0),
+      smoothStrength,
+      simplifyAmount: Number(ui.shapeSimplify?.value || 0),
+      maxContours: MAX_VECTOR_CONTOURS,
+      maxPoints: MAX_VECTOR_POINTS
+    });
+    if (!result || generation !== rasterVectorState.vectorGeneration) return;
 
-  for (let i = 0; i < mask.length; i++) {
-    const idx = i * 4;
-    const r = image.data[idx];
-    const g = image.data[idx + 1];
-    const b = image.data[idx + 2];
-    const a = image.data[idx + 3] / 255;
-    const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    const effective = luminance * a + 255 * (1 - a);
-    const filled = invert ? effective >= threshold : effective < threshold;
-    mask[i] = filled ? 1 : 0;
+    const { width, height } = rasterVectorState;
+    const cleaned = result.mask instanceof Uint8Array ? result.mask : new Uint8Array(result.mask || []);
+    const loops = Array.isArray(result.loops) ? result.loops : [];
+    const bounds = buildMaskBounds(cleaned, width, height);
+    rasterVectorState.mask = cleaned;
+    rasterVectorState.rawLoops = loops;
+    rasterVectorState.loops = loops;
+    rasterVectorState.svg = typeof result.svg === 'string' ? result.svg : rasterLoopsToSvg(loops, width, height);
+    rasterVectorState.bounds = bounds;
+    rasterVectorState.aspect = bounds ? bounds.width / Math.max(1e-6, bounds.height) : rasterVectorState.aspect;
+
+    updateShapePreviewBinary(cleaned, width, height);
+    updateShapePreviewVector(loops, width, height);
+    if (ui.shapeDownloadSvgBtn) ui.shapeDownloadSvgBtn.disabled = !loops.length;
+    if (ui.shapeGenerateBtn) ui.shapeGenerateBtn.disabled = !loops.length;
+
+    if (!bounds || !loops.length) {
+      updateShapeInfo('No se encontraron contornos útiles. Ajusta el umbral o invierte la figura.', true);
+      return;
+    }
+    updateShapeInfo(`Vector listo: ${loops.length} contorno(s), ${(result.pointCount || loops.reduce((sum, loop) => sum + loop.length, 0)).toLocaleString()} puntos, área útil ${bounds.width}×${bounds.height} px.`);
+  } catch (error) {
+    if (generation !== rasterVectorState.vectorGeneration) return;
+    console.error(error);
+    updateShapeInfo(error?.message || 'El vectorizador no pudo procesar esta imagen.', true);
   }
-
-  const denoised = removeSmallMaskComponents(mask, width, height, noiseArea);
-  const cleaned = smoothMask(denoised, width, height, smoothStrength);
-  const rawLoops = traceMaskLoops(cleaned, width, height);
-  const loops = processRasterLoops(rawLoops, width, height);
-  const bounds = buildMaskBounds(cleaned, width, height);
-  rasterVectorState.mask = cleaned;
-  rasterVectorState.width = width;
-  rasterVectorState.height = height;
-  rasterVectorState.rawLoops = rawLoops;
-  rasterVectorState.loops = loops;
-  rasterVectorState.svg = rasterLoopsToSvg(loops, width, height);
-  rasterVectorState.bounds = bounds;
-  rasterVectorState.aspect = bounds ? bounds.width / Math.max(1e-6, bounds.height) : rasterVectorState.aspect;
-
-  updateShapePreviewBinary(cleaned, width, height);
-  updateShapePreviewVector(loops, width, height);
-  if (ui.shapeDownloadSvgBtn) ui.shapeDownloadSvgBtn.disabled = !loops.length;
-  if (ui.shapeGenerateBtn) ui.shapeGenerateBtn.disabled = !loops.length;
-
-  if (!bounds || !loops.length) {
-    updateShapeInfo('No se encontraron contornos útiles. Ajusta el umbral o invierte la figura.', true);
-    return;
-  }
-  updateShapeInfo(`Vector listo: ${loops.length} contorno(s), área útil ${bounds.width}×${bounds.height} px, suavizado ${Math.round(smoothStrength)}%.`);
 }
 
 function loadShapeImageFile(file) {
   if (!file) return;
+  if (file.size > MAX_IMAGE_FILE_BYTES) {
+    updateShapeInfo(`La imagen es demasiado grande (${(file.size / 1024 / 1024).toFixed(1)} MB). Máximo recomendado: 40 MB.`, true);
+    setStatus('Imagen rechazada por tamaño excesivo');
+    return;
+  }
   if (!file.type.startsWith('image/')) {
     updateShapeInfo('Formato no compatible. Usa PNG, JPG, WEBP, BMP o GIF.', true);
     setStatus('Formato de imagen no compatible para 2D → 3D');
@@ -3647,6 +3925,13 @@ function loadShapeImageFile(file) {
   const img = new Image();
   img.onload = () => {
     URL.revokeObjectURL(objectUrl);
+    const naturalWidth = img.naturalWidth || img.width;
+    const naturalHeight = img.naturalHeight || img.height;
+    if (naturalWidth * naturalHeight > MAX_IMAGE_PIXELS) {
+      updateShapeInfo(`Imagen demasiado grande: ${naturalWidth}×${naturalHeight} px. Reduce la resolución antes de vectorizar.`, true);
+      setStatus('Imagen rechazada por resolución excesiva');
+      return;
+    }
     const maxSide = 512;
     const scale = Math.min(1, maxSide / Math.max(img.naturalWidth || img.width, img.naturalHeight || img.height));
     const width = Math.max(4, Math.round((img.naturalWidth || img.width) * scale));
@@ -3656,6 +3941,9 @@ function loadShapeImageFile(file) {
     rasterVectorState.sourceCtx.clearRect(0, 0, width, height);
     rasterVectorState.sourceCtx.drawImage(img, 0, 0, width, height);
     rasterVectorState.sourceName = file.name.replace(/\.[^.]+$/, '');
+    rasterVectorState.width = width;
+    rasterVectorState.height = height;
+    rasterVectorState.sourcePixels = new Uint8ClampedArray(rasterVectorState.sourceCtx.getImageData(0, 0, width, height).data);
     rasterVectorState.aspect = width / Math.max(1, height);
     ui.shapeWidth.value = '50';
     ui.shapeHeight.value = (50 / rasterVectorState.aspect).toFixed(2);
@@ -3681,6 +3969,28 @@ function downloadCurrentShapeSvg() {
   setStatus('SVG generado descargado');
 }
 
+function polygonInteriorProbe(points) {
+  if (!points?.length) return new THREE.Vector2();
+  const area = loopSignedArea(points);
+  let bestA = points[0], bestB = points[1] || points[0], bestLen = -1;
+  for (let i = 0; i < points.length; i++) {
+    const a = points[i], b = points[(i + 1) % points.length];
+    const len = a.distanceToSquared(b);
+    if (len > bestLen) { bestLen = len; bestA = a; bestB = b; }
+  }
+  const mid = bestA.clone().add(bestB).multiplyScalar(0.5);
+  const dx = bestB.x - bestA.x, dy = bestB.y - bestA.y;
+  const length = Math.max(1e-9, Math.hypot(dx, dy));
+  const inward = area >= 0 ? new THREE.Vector2(-dy / length, dx / length) : new THREE.Vector2(dy / length, -dx / length);
+  const nudge = Math.max(1e-5, Math.sqrt(bestLen) * 1e-4);
+  const probe = mid.clone().addScaledVector(inward, nudge);
+  if (pointInPolygon(probe, points)) return probe;
+  const opposite = mid.clone().addScaledVector(inward, -nudge);
+  if (pointInPolygon(opposite, points)) return opposite;
+  const avg = averagePoint(points);
+  return pointInPolygon(avg, points) ? avg : mid;
+}
+
 function buildExtrudeShapesFromRaster() {
   const loops = rasterVectorState.loops || [];
   const bounds = rasterVectorState.bounds;
@@ -3690,32 +4000,43 @@ function buildExtrudeShapesFromRaster() {
   const scaleX = targetWidth / Math.max(1e-6, bounds.width);
   const scaleY = targetHeight / Math.max(1e-6, bounds.height);
 
-  const transformed = loops.map((loop) => {
+  const nodes = loops.map((loop, index) => {
     const points = loop.map((point) => new THREE.Vector2((point.x - bounds.minX) * scaleX, (bounds.maxY - point.y) * scaleY));
-    const area = loopSignedArea(loop);
-    return { points, area };
-  }).filter((entry) => entry.points.length >= 3);
+    return { index, points, area: loopSignedArea(points), parent: null, depth: 0 };
+  }).filter((node) => node.points.length >= 3 && Math.abs(node.area) > 1e-8);
 
-  const outers = [];
-  const holes = [];
-  for (const entry of transformed) {
-    const areaYUp = loopSignedArea(entry.points);
-    if (entry.area >= 0) {
-      if (areaYUp < 0) entry.points.reverse();
-      outers.push(entry);
-    } else {
-      if (areaYUp > 0) entry.points.reverse();
-      holes.push(entry);
+  nodes.sort((a, b) => Math.abs(b.area) - Math.abs(a.area));
+  for (let i = 0; i < nodes.length; i++) {
+    const node = nodes[i];
+    const probe = polygonInteriorProbe(node.points);
+    let bestParent = null;
+    for (let j = 0; j < i; j++) {
+      const candidate = nodes[j];
+      if (Math.abs(candidate.area) <= Math.abs(node.area)) continue;
+      if (!pointInPolygon(probe, candidate.points)) continue;
+      if (!bestParent || Math.abs(candidate.area) < Math.abs(bestParent.area)) bestParent = candidate;
     }
+    node.parent = bestParent;
+    node.depth = bestParent ? bestParent.depth + 1 : 0;
   }
 
-  const shapes = outers.map((outer) => ({ shape: new THREE.Shape(outer.points), points: outer.points }));
-  for (const hole of holes) {
-    const test = averagePoint(hole.points);
-    const parent = shapes.find((entry) => pointInPolygon(test, entry.points));
-    if (parent) parent.shape.holes.push(new THREE.Path(hole.points));
+  const shapeByNode = new Map();
+  for (const node of nodes) {
+    if (node.depth % 2 !== 0) continue;
+    const points = node.area < 0 ? node.points.slice().reverse() : node.points.slice();
+    const shape = new THREE.Shape(points);
+    shapeByNode.set(node, shape);
   }
-  return shapes.map((entry) => entry.shape);
+  for (const node of nodes) {
+    if (node.depth % 2 === 0) continue;
+    let parent = node.parent;
+    while (parent && parent.depth % 2 !== 0) parent = parent.parent;
+    const shape = parent ? shapeByNode.get(parent) : null;
+    if (!shape) continue;
+    const points = node.area > 0 ? node.points.slice().reverse() : node.points.slice();
+    shape.holes.push(new THREE.Path(points));
+  }
+  return Array.from(shapeByNode.values());
 }
 
 function createExtrudedShapeObject() {
@@ -3742,7 +4063,6 @@ function createExtrudedShapeObject() {
     geometry.rotateX(-Math.PI / 2);
     geometry.computeVertexNormals();
     const record = addImportedMesh(geometry, `${rasterVectorState.sourceName || 'Silueta'} 3D`, 'image-extrude');
-    geometry.dispose?.();
     if (record) {
       pushObjectsAdded('Crear objeto desde imagen', [record]);
       selectObject(record.mesh);
@@ -3758,6 +4078,11 @@ function createExtrudedShapeObject() {
 
 function importModelFile(file) {
   if (!file) return;
+  const maxModelFileBytes = getMaxModelFileBytes();
+  if (file.size > maxModelFileBytes) {
+    setStatus(`Archivo demasiado grande (${(file.size / 1024 / 1024).toFixed(1)} MB). Límite actual: ${modelFileLimitMB} MB.`);
+    return;
+  }
   const ext = file.name.toLowerCase().split('.').pop();
   const baseName = file.name.replace(/\.(obj|stl|gltf|glb)$/i, '');
   const reader = new FileReader();
@@ -3769,9 +4094,25 @@ function importModelFile(file) {
         importThreeObject(loaded, baseName);
       } else if (ext === 'stl') {
         const geo = new STLLoader().parse(reader.result);
+        const vertices = geo.getAttribute('position')?.count || 0;
+        if (vertices > MAX_IMPORT_VERTICES) {
+          geo.dispose?.();
+          setStatus(`STL rechazado: ${vertices.toLocaleString()} vértices exceden el límite de seguridad.`);
+          return;
+        }
         const rec = addImportedMesh(geo, baseName, 'imported');
         if (rec) pushObjectsAdded('Importar modelo', [rec]);
       } else if (ext === 'gltf' || ext === 'glb') {
+        if (ext === 'gltf') {
+          let doc;
+          try { doc = JSON.parse(reader.result); } catch { doc = null; }
+          const externalBuffers = (doc?.buffers || []).some((buffer) => buffer.uri && !buffer.uri.startsWith('data:'));
+          const externalImages = (doc?.images || []).some((image) => image.uri && !image.uri.startsWith('data:'));
+          if (externalBuffers || externalImages) {
+            setStatus('Este glTF usa archivos externos. Usa GLB o un glTF autocontenido.');
+            return;
+          }
+        }
         new GLTFLoader().parse(reader.result, '', (gltf) => {
           importThreeObject(gltf.scene, baseName);
           setStatus(`Modelo importado: ${file.name}`);
@@ -3793,34 +4134,39 @@ function importModelFile(file) {
 
 function importThreeObject(root, baseName) {
   root.updateMatrixWorld(true);
-  const parts = [];
+  const meshParts = [];
+  let totalVertices = 0;
   let count = 0;
-  const combinedBox = new THREE.Box3();
-
   root.traverse((child) => {
-    if (!child.isMesh || !child.geometry?.getAttribute('position')) return;
-    const geometry = child.geometry.clone();
-    // Conserva jerarquías y transformaciones anidadas de OBJ/GLTF convirtiendo
-    // cada parte a coordenadas comunes antes de separarla en objetos editables.
-    geometry.applyMatrix4(child.matrixWorld);
-    geometry.computeBoundingBox();
-    if (geometry.boundingBox) combinedBox.union(geometry.boundingBox);
-    parts.push({ geometry, name: child.name || `${baseName}_${++count}` });
+    const position = child?.geometry?.getAttribute?.('position');
+    if (!child.isMesh || !position) return;
+    totalVertices += position.count;
+    meshParts.push(child);
   });
 
-  if (!parts.length) {
+  if (!meshParts.length) {
     setStatus('El archivo no contiene mallas editables.');
     return;
   }
+  if (totalVertices > MAX_IMPORT_VERTICES) {
+    setStatus(`Modelo rechazado: ${totalVertices.toLocaleString()} vértices exceden el límite de seguridad.`);
+    return;
+  }
 
+  // Calculamos el encuadre sin clonar todas las geometrías simultáneamente.
+  const combinedBox = new THREE.Box3().setFromObject(root);
   const center = combinedBox.getCenter(new THREE.Vector3());
-  const offset = new THREE.Matrix4().makeTranslation(-center.x, -combinedBox.min.y, -center.z);
+  const floorY = Number.isFinite(combinedBox.min.y) ? combinedBox.min.y : 0;
+  const offset = new THREE.Matrix4().makeTranslation(-center.x, -floorY, -center.z);
   const importedRecords = [];
-  for (const part of parts) {
-    part.geometry.applyMatrix4(offset);
-    const rec = addImportedMesh(part.geometry, part.name, 'imported', { preservePlacement: true, autoSelect: false });
+
+  for (const child of meshParts) {
+    const geometry = child.geometry.clone();
+    geometry.applyMatrix4(child.matrixWorld);
+    geometry.applyMatrix4(offset);
+    const rec = addImportedMesh(geometry, child.name || `${baseName}_${++count}`, 'imported', { preservePlacement: true, autoSelect: false });
     if (rec) importedRecords.push(rec);
-    part.geometry.dispose?.();
+    else geometry.dispose?.();
   }
 
   const last = importedRecords.at(-1);
@@ -3834,11 +4180,13 @@ function importThreeObject(root, baseName) {
 }
 
 function addImportedMesh(geometry, name, type = 'imported', options = {}) {
+  if (!geometry?.getAttribute?.('position')) return null;
   const textureSet = makeTextureCanvas(ui.baseColor.value);
-  const source = geometry.clone();
+  // Transferimos la propiedad de la geometría a SculptCAD. Evita dos copias
+  // completas adicionales durante importaciones grandes.
+  const source = geometry;
   if (!options.preservePlacement) source.center();
-  const geo = prepareGeometry(source);
-  source.dispose?.();
+  const geo = prepareGeometry(source, { clone: false });
   const mesh = new THREE.Mesh(geo, createMaterial(textureSet));
   mesh.name = name || `Importado ${state.idCounter}`;
   if (!options.preservePlacement) {
@@ -3847,7 +4195,7 @@ function addImportedMesh(geometry, name, type = 'imported', options = {}) {
   }
   mesh.castShadow = true;
   mesh.receiveShadow = false;
-  const record = { id: state.idCounter++, type, mesh, textureSet, pbrMaterial: mesh.material, matcapMaterials: new Map(), createdAt: Date.now() };
+  const record = { id: state.idCounter++, type, mesh, textureSet, pbrMaterial: mesh.material, matcapMaterials: new Map(), materialPresetId: null, createdAt: Date.now(), geometryVersion: 0 };
   mesh.userData.recordId = record.id;
   scene.add(mesh);
   state.objects.push(record);
@@ -4052,7 +4400,7 @@ function bindUI() {
 
   ui.objectName.addEventListener('change', () => {
     if (!state.selected) return;
-    pushObjectHistory('Renombrar objeto');
+    pushObjectMetaHistory('Renombrar objeto');
     state.selected.name = ui.objectName.value.trim() || state.selected.name;
     renderObjectList();
     updateInspector();
@@ -4068,16 +4416,32 @@ function bindUI() {
     importModelFile(event.target.files[0]);
     event.target.value = '';
   });
+  if (ui.modelFileLimit) {
+    ui.modelFileLimit.value = String(modelFileLimitMB);
+    ui.modelFileLimit.addEventListener('input', () => {
+      modelFileLimitMB = THREE.MathUtils.clamp(
+        Math.round(Number(ui.modelFileLimit.value) || DEFAULT_MODEL_FILE_LIMIT_MB),
+        DEFAULT_MODEL_FILE_LIMIT_MB,
+        MAX_MODEL_FILE_LIMIT_MB
+      );
+      ui.modelFileLimit.value = String(modelFileLimitMB);
+      updateRangeOutputs();
+      try { localStorage.setItem(MODEL_FILE_LIMIT_STORAGE_KEY, String(modelFileLimitMB)); } catch {}
+    });
+    ui.modelFileLimit.addEventListener('change', () => {
+      setStatus(`Límite de importación configurado en ${modelFileLimitMB} MB`);
+    });
+  }
   ui.shapeImageInput?.addEventListener('change', (event) => {
     loadShapeImageFile(event.target.files?.[0]);
     event.target.value = '';
   });
   [ui.shapeThreshold, ui.shapeNoiseArea, ui.shapeSmoothness, ui.shapeSimplify, ui.shapeBevel].forEach((control) => control?.addEventListener('input', () => {
     updateRangeOutputs();
-    if (control !== ui.shapeBevel) refreshRasterVectorFromControls();
+    if (control !== ui.shapeBevel) scheduleRasterVectorRefresh();
   }));
-  ui.shapeInvert?.addEventListener('change', refreshRasterVectorFromControls);
-  ui.shapeRefreshBtn?.addEventListener('click', refreshRasterVectorFromControls);
+  ui.shapeInvert?.addEventListener('change', () => scheduleRasterVectorRefresh(0));
+  ui.shapeRefreshBtn?.addEventListener('click', () => scheduleRasterVectorRefresh(0));
   ui.shapeGenerateBtn?.addEventListener('click', createExtrudedShapeObject);
   ui.shapeDownloadSvgBtn?.addEventListener('click', downloadCurrentShapeSvg);
   ui.shapeWidth?.addEventListener('change', () => syncShapeAspect('width'));
@@ -4087,19 +4451,36 @@ function bindUI() {
   [ui.brushRadius, ui.brushStrength, ui.creasePinch, ui.creaseDepth, ui.dynamicTopoEdge, ui.paintRadius, ui.paintOpacity].forEach((control) => {
     control?.addEventListener('input', updateRangeOutputs);
   });
-  ui.metalness.addEventListener('input', () => { updateMaterial(); updateRangeOutputs(); });
-  ui.roughness.addEventListener('input', () => { updateMaterial(); updateRangeOutputs(); });
-  ui.baseColor.addEventListener('change', applyBaseColor);
+  ui.metalness.addEventListener('input', updateRangeOutputs);
+  ui.roughness.addEventListener('input', updateRangeOutputs);
+  ui.materialTextureStrength?.addEventListener('input', updateRangeOutputs);
+  ui.materialTextureSize?.addEventListener('input', updateRangeOutputs);
+  ui.materialPresetTab?.addEventListener('click', () => setMaterialMode('preset'));
+  ui.materialCustomTab?.addEventListener('click', () => setMaterialMode('custom'));
+  ui.applyCustomMaterialBtn?.addEventListener('click', applyCustomMaterial);
   ui.viewMode?.addEventListener('change', () => applyViewModeToScene(ui.viewMode.value));
   ui.snapGrid?.addEventListener('change', updateDependentControls);
   ui.dynamicTopology?.addEventListener('change', updateDependentControls);
 
   const closeExportMenu = () => document.querySelector('.export-menu')?.removeAttribute('open');
+  const closeProjectMenu = () => document.querySelector('.mobile-project-menu')?.removeAttribute('open');
+  const exportMenu = document.querySelector('.export-menu');
+  const projectMenu = document.querySelector('.mobile-project-menu');
+  exportMenu?.addEventListener('toggle', () => { if (exportMenu.open) closeProjectMenu(); });
+  projectMenu?.addEventListener('toggle', () => { if (projectMenu.open) closeExportMenu(); });
+  document.addEventListener('pointerdown', (event) => {
+    if (!event.target.closest?.('.export-menu')) closeExportMenu();
+    if (!event.target.closest?.('.mobile-project-menu')) closeProjectMenu();
+  });
   on('duplicateBtn', 'click', duplicateSelected);
   on('deleteBtn', 'click', deleteSelected);
   on('undoBtn', 'click', undo);
   on('redoBtn', 'click', redo);
   on('newSceneBtn', 'click', clearScene);
+  on('mobileNewSceneBtn', 'click', () => { clearScene(); document.querySelector('.mobile-project-menu')?.removeAttribute('open'); });
+  on('mobileImportBtn', 'click', () => { ui.modelInput?.click(); document.querySelector('.mobile-project-menu')?.removeAttribute('open'); });
+  on('mobileSaveBtn', 'click', () => { saveProjectLocal(); document.querySelector('.mobile-project-menu')?.removeAttribute('open'); });
+  on('mobileLoadBtn', 'click', () => { loadProjectLocal(); document.querySelector('.mobile-project-menu')?.removeAttribute('open'); });
   on('clearTextureBtn', 'click', clearTexture);
   on('saveTextureBtn', 'click', () => { saveTexture(); closeExportMenu(); });
   on('saveTexturePanelBtn', 'click', saveTexture);
@@ -4111,11 +4492,9 @@ function bindUI() {
   on('exportStlSceneBtn', 'click', () => exportSTL(false));
   on('exportStlSelectedQuickBtn', 'click', () => { exportSTL(true); closeExportMenu(); });
   on('exportStlSceneQuickBtn', 'click', () => { exportSTL(false); closeExportMenu(); });
-  on('saveLocalBtn', 'click', saveProjectLocal);
   on('saveLocalTopBtn', 'click', saveProjectLocal);
   on('loadLocalBtn', 'click', loadProjectLocal);
   on('centerObjectBtn', 'click', centerSelected);
-  on('focusBtn', 'click', frameSelection);
   on('focusQuickBtn', 'click', frameSelection);
   on('clearMaskBtn', 'click', clearMask);
   on('invertMaskBtn', 'click', invertMask);
@@ -4142,6 +4521,8 @@ function bindUI() {
     setStatus(labels[ui.sculptMode.value] || `Pincel: ${ui.sculptMode.options[ui.sculptMode.selectedIndex].text}`);
   });
 
+  renderMaterialPresetCatalog();
+  setMaterialMode('preset');
   initCollapsiblePanels();
   updateSculptToolOptions();
   updateDependentControls();

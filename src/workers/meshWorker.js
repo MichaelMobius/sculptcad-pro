@@ -84,42 +84,112 @@ function subdivideData(data) {
   };
 }
 
-function buildVertexNeighbors(data) {
-  const vertexCount = data.positions.length / 3;
+function buildWeldedTopology(data, epsilon = null) {
+  const positions = data.positions;
+  const vertexCount = positions.length / 3;
   const indices = getTriangleIndices(data.index, vertexCount);
-  const neighbors = Array.from({ length: vertexCount }, () => new Set());
-  const add = (a, b) => {
-    if (a === b || a < 0 || b < 0 || a >= vertexCount || b >= vertexCount) return;
-    neighbors[a].add(b);
-    neighbors[b].add(a);
+  const vertexToGroup = new Uint32Array(vertexCount);
+  const groups = [];
+  const buckets = new Map();
+  if (!(epsilon > 0)) {
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (let i = 0; i < positions.length; i += 3) {
+      const x = positions[i], y = positions[i + 1], z = positions[i + 2];
+      if (x < minX) minX = x; if (y < minY) minY = y; if (z < minZ) minZ = z;
+      if (x > maxX) maxX = x; if (y > maxY) maxY = y; if (z > maxZ) maxZ = z;
+    }
+    const diagonal = Math.hypot(maxX - minX, maxY - minY, maxZ - minZ);
+    epsilon = Math.max(1e-9, diagonal * 1e-7);
+  }
+  const inv = 1 / Math.max(epsilon, 1e-12);
+
+  const getBucket = (qx, qy, qz) => buckets.get(qx)?.get(qy)?.get(qz);
+  const setBucket = (qx, qy, qz, value) => {
+    let byY = buckets.get(qx);
+    if (!byY) buckets.set(qx, byY = new Map());
+    let byZ = byY.get(qy);
+    if (!byZ) byY.set(qy, byZ = new Map());
+    byZ.set(qz, value);
   };
+
+  for (let i = 0; i < vertexCount; i++) {
+    const k = i * 3;
+    const qx = Math.round(positions[k] * inv);
+    const qy = Math.round(positions[k + 1] * inv);
+    const qz = Math.round(positions[k + 2] * inv);
+    let groupId = getBucket(qx, qy, qz);
+    if (groupId === undefined) {
+      groupId = groups.length;
+      setBucket(qx, qy, qz, groupId);
+      groups.push({ vertices: [], neighbors: new Set() });
+    }
+    vertexToGroup[i] = groupId;
+    groups[groupId].vertices.push(i);
+  }
+
+  const addNeighbor = (a, b) => {
+    const ga = vertexToGroup[a];
+    const gb = vertexToGroup[b];
+    if (ga === gb) return;
+    groups[ga].neighbors.add(gb);
+    groups[gb].neighbors.add(ga);
+  };
+
   for (let i = 0; i < indices.length; i += 3) {
     const a = indices[i];
     const b = indices[i + 1];
     const c = indices[i + 2];
-    add(a, b); add(b, c); add(c, a);
+    addNeighbor(a, b); addNeighbor(b, c); addNeighbor(c, a);
   }
-  return neighbors.map((set) => Array.from(set));
+
+  return {
+    vertexToGroup,
+    groups: groups.map((group) => ({ vertices: group.vertices, neighbors: Array.from(group.neighbors) }))
+  };
 }
 
-function laplacianStep(positions, neighbors, factor) {
+function laplacianWeldedStep(positions, topology, factor) {
   const src = new Float32Array(positions);
-  for (let i = 0; i < neighbors.length; i++) {
-    const list = neighbors[i];
-    if (!list || !list.length) continue;
-    let ax = 0, ay = 0, az = 0;
-    for (const j of list) {
-      const k = j * 3;
-      ax += src[k];
-      ay += src[k + 1];
-      az += src[k + 2];
+  const groupCenters = new Float64Array(topology.groups.length * 3);
+
+  for (let g = 0; g < topology.groups.length; g++) {
+    const vertices = topology.groups[g].vertices;
+    if (!vertices.length) continue;
+    let x = 0, y = 0, z = 0;
+    for (const vertex of vertices) {
+      const k = vertex * 3;
+      x += src[k]; y += src[k + 1]; z += src[k + 2];
     }
-    const inv = 1 / list.length;
+    const inv = 1 / vertices.length;
+    const base = g * 3;
+    groupCenters[base] = x * inv;
+    groupCenters[base + 1] = y * inv;
+    groupCenters[base + 2] = z * inv;
+  }
+
+  for (let g = 0; g < topology.groups.length; g++) {
+    const group = topology.groups[g];
+    if (!group.neighbors.length) continue;
+    let ax = 0, ay = 0, az = 0;
+    for (const neighbor of group.neighbors) {
+      const k = neighbor * 3;
+      ax += groupCenters[k];
+      ay += groupCenters[k + 1];
+      az += groupCenters[k + 2];
+    }
+    const inv = 1 / group.neighbors.length;
     ax *= inv; ay *= inv; az *= inv;
-    const base = i * 3;
-    positions[base] += (ax - src[base]) * factor;
-    positions[base + 1] += (ay - src[base + 1]) * factor;
-    positions[base + 2] += (az - src[base + 2]) * factor;
+    const base = g * 3;
+    const nx = groupCenters[base] + (ax - groupCenters[base]) * factor;
+    const ny = groupCenters[base + 1] + (ay - groupCenters[base + 1]) * factor;
+    const nz = groupCenters[base + 2] + (az - groupCenters[base + 2]) * factor;
+    for (const vertex of group.vertices) {
+      const k = vertex * 3;
+      positions[k] = nx;
+      positions[k + 1] = ny;
+      positions[k + 2] = nz;
+    }
   }
 }
 
@@ -130,10 +200,13 @@ function relaxData(data, iterations = 4) {
     masks: data.masks ? new Float32Array(data.masks) : null,
     index: data.index ? new Uint32Array(data.index) : null
   };
-  const neighbors = buildVertexNeighbors(result);
+  // Weld lógico: STL y otras geometrías no indexadas duplican vértices por cara.
+  // Relajar por índice separaba esos duplicados y abría grietas. Aquí los vértices
+  // coincidentes comparten una posición de grupo, conservando las costuras UV.
+  const topology = buildWeldedTopology(result);
   for (let i = 0; i < iterations; i++) {
-    laplacianStep(result.positions, neighbors, 0.42);
-    laplacianStep(result.positions, neighbors, -0.36);
+    laplacianWeldedStep(result.positions, topology, 0.42);
+    laplacianWeldedStep(result.positions, topology, -0.36);
   }
   return result;
 }

@@ -179,8 +179,44 @@ export function softRemeshGeometry(geometry, { subdivide = true, relaxIterations
 }
 
 
+function buildWeldedVertexIds(position, epsilon = null) {
+  const ids = new Uint32Array(position.count);
+  const buckets = new Map();
+  if (!(epsilon > 0)) {
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (let i = 0; i < position.count; i++) {
+      const x = position.getX(i), y = position.getY(i), z = position.getZ(i);
+      if (x < minX) minX = x; if (y < minY) minY = y; if (z < minZ) minZ = z;
+      if (x > maxX) maxX = x; if (y > maxY) maxY = y; if (z > maxZ) maxZ = z;
+    }
+    const diagonal = Math.hypot(maxX - minX, maxY - minY, maxZ - minZ);
+    epsilon = Math.max(1e-9, diagonal * 1e-7);
+  }
+  const inv = 1 / Math.max(epsilon, 1e-12);
+  let nextId = 0;
+  const get = (x, y, z) => buckets.get(x)?.get(y)?.get(z);
+  const set = (x, y, z, value) => {
+    let byY = buckets.get(x);
+    if (!byY) buckets.set(x, byY = new Map());
+    let byZ = byY.get(y);
+    if (!byZ) byY.set(y, byZ = new Map());
+    byZ.set(z, value);
+  };
+  for (let i = 0; i < position.count; i++) {
+    const x = Math.round(position.getX(i) * inv);
+    const y = Math.round(position.getY(i) * inv);
+    const z = Math.round(position.getZ(i) * inv);
+    let id = get(x, y, z);
+    if (id === undefined) { id = nextId++; set(x, y, z, id); }
+    ids[i] = id;
+  }
+  return { ids, count: nextId };
+}
+
 export function localSubdivideGeometry(geometry, {
   center = new THREE.Vector3(),
+  centers = null,
   radius = 1,
   maxEdgeLength = 0.08,
   maxTriangles = 900,
@@ -212,11 +248,23 @@ export function localSubdivideGeometry(geometry, {
   const candidates = [];
   const selected = new Set();
   const edgeToTriangles = new Map();
-  const vertexCount = position.count + 1;
+  // Para STL/no-indexed, caras vecinas suelen tener índices distintos aunque
+  // compartan exactamente la misma arista. Las decisiones rojo-verde usan IDs
+  // soldados por posición para que ambos lados de la costura se refinen juntos.
+  const welded = buildWeldedVertexIds(position);
+  const weldedBase = welded.count + 1;
+  const actualBase = position.count + 1;
   const edgeKey = (a, b) => {
+    const wa = welded.ids[a];
+    const wb = welded.ids[b];
+    const lo = Math.min(wa, wb);
+    const hi = Math.max(wa, wb);
+    return lo * weldedBase + hi;
+  };
+  const actualEdgeKey = (a, b) => {
     const lo = Math.min(a, b);
     const hi = Math.max(a, b);
-    return lo * vertexCount + hi;
+    return lo * actualBase + hi;
   };
   const edgeLenSq = (a, b) => {
     const dx = position.getX(a) - position.getX(b);
@@ -227,6 +275,7 @@ export function localSubdivideGeometry(geometry, {
 
   const radiusSq = radius * radius;
   const maxEdgeSq = maxEdgeLength * maxEdgeLength;
+  const activeCenters = Array.isArray(centers) && centers.length ? centers : [center];
 
   for (const tri of scanTriangles) {
     const i = tri * 3;
@@ -245,21 +294,51 @@ export function localSubdivideGeometry(geometry, {
     const cx = (position.getX(a) + position.getX(b) + position.getX(c)) / 3;
     const cy = (position.getY(a) + position.getY(b) + position.getY(c)) / 3;
     const cz = (position.getZ(a) + position.getZ(b) + position.getZ(c)) / 3;
-    const dx = cx - center.x;
-    const dy = cy - center.y;
-    const dz = cz - center.z;
-    const distSq = dx * dx + dy * dy + dz * dz;
+    let distSq = Infinity;
+    let centerIndex = 0;
+    for (let ci = 0; ci < activeCenters.length; ci++) {
+      const activeCenter = activeCenters[ci];
+      const dx = cx - activeCenter.x;
+      const dy = cy - activeCenter.y;
+      const dz = cz - activeCenter.z;
+      const candidateDistSq = dx * dx + dy * dy + dz * dz;
+      if (candidateDistSq < distSq) {
+        distSq = candidateDistSq;
+        centerIndex = ci;
+      }
+    }
     const longestSq = Math.max(edgeLenSq(a, b), edgeLenSq(b, c), edgeLenSq(c, a));
 
     if (distSq <= radiusSq && longestSq > maxEdgeSq) {
-      candidates.push({ tri, distSq, longestSq });
+      candidates.push({ tri, distSq, longestSq, centerIndex });
     }
   }
 
   if (!candidates.length) return { geometry: null, changed: false, splitTriangles: 0, addedTriangles: 0 };
 
   candidates.sort((a, b) => a.distSq - b.distSq || b.longestSq - a.longestSq);
-  for (const item of candidates.slice(0, Math.max(1, maxTriangles))) selected.add(item.tri);
+  if (activeCenters.length <= 1) {
+    for (const item of candidates.slice(0, Math.max(1, maxTriangles))) selected.add(item.tri);
+  } else {
+    // Reparte el presupuesto de triángulos entre las regiones simétricas. Un
+    // único sort global podía consumir el límite en el lado original y dejar
+    // los reflejos con menor densidad.
+    const perCenter = Array.from({ length: activeCenters.length }, () => []);
+    for (const item of candidates) perCenter[item.centerIndex]?.push(item);
+    let cursor = 0;
+    while (selected.size < Math.max(1, maxTriangles)) {
+      let added = false;
+      for (const bucket of perCenter) {
+        const item = bucket[cursor];
+        if (!item) continue;
+        selected.add(item.tri);
+        added = true;
+        if (selected.size >= maxTriangles) break;
+      }
+      if (!added) break;
+      cursor++;
+    }
+  }
 
   // La expansión sigue siendo una aproximación local, no un refinamiento
   // rojo-verde completo. Al menos ahora opera solo sobre el vecindario que ya
@@ -304,7 +383,7 @@ export function localSubdivideGeometry(geometry, {
   const midpointCache = new Map();
 
   const addMidpoint = (a, b) => {
-    const key = edgeKey(a, b);
+    const key = actualEdgeKey(a, b);
     const cached = midpointCache.get(key);
     if (cached !== undefined) return cached;
 

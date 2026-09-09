@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="src/assets/sculptcad-pro_github.png" width="620" alt="SculptCAD Pro" />
+  <img src="src/assets/logo-sculptcad-pro.png" width="620" alt="SculptCAD Pro" />
 </p>
 
 <p align="center">
@@ -21,7 +21,7 @@ La aplicación reúne creación de primitivas, transformaciones, pinceles de esc
 - Edición numérica de dimensiones X, Y y Z.
 - Ajuste a grilla, bloqueo de proporciones y apoyo automático sobre el plano.
 - Duplicación, eliminación, renombrado y gestión de objetos de la escena.
-- Importación de modelos OBJ, STL y GLTF/GLB.
+- Importación de modelos OBJ, STL, GLB y glTF autocontenido.
 
 ### Escultura
 
@@ -30,15 +30,22 @@ La aplicación reúne creación de primitivas, transformaciones, pinceles de esc
 - Radio, fuerza, acumulación, superficie delgada e inversión de dirección.
 - Simetría en los ejes X, Y y Z, calculada en el espacio local del objeto.
 - Máscara de protección con opciones para borrar, invertir y suavizar bordes.
-- Topología dinámica localizada durante la escultura.
-- Subdivisión, remallado, reducción de polígonos y relajación de topología mediante Web Worker.
+- Topología dinámica localizada durante la escultura, incluyendo continuidad rojo-verde sobre mallas indexadas y STL/no-indexed mediante aristas soldadas por posición.
+- Subdivisión, **Subdividir + relajar**, reducción de polígonos y relajación de topología mediante Web Worker.
+- Relajación con soldadura lógica adaptativa de vértices coincidentes para evitar grietas en STL sin fusionar por error láminas muy próximas.
+- Dynamic Topology simétrica: las regiones reflejadas comparten el presupuesto de refinamiento en una sola operación.
+- Las operaciones de malla en Worker quedan asociadas al objeto y versión geométrica que las originó; si el objeto cambia durante el cálculo, el resultado obsoleto se descarta.
 
 ### Pintura y materiales
 
-- Pintura directa sobre la textura UV del objeto.
+- Pintura directa sobre la textura UV del objeto. Los objetos sin UV muestran una advertencia en lugar de fallar silenciosamente.
+- El historial de pintura captura únicamente tiles de la textura que realmente fueron modificados, reduciendo memoria por trazo.
 - Control de color, tamaño y opacidad del pincel.
 - Carga de una imagen como textura.
-- Ajuste del color base, metalidad y rugosidad.
+- Sistema de materiales con dos modos: **Preset** y **Custom**.
+- Galería de presets procedurales agrupados en **Forged Chrome**, **Solar Gold**, **Cosmic Gradient** y **Galactic Patterns**.
+- Custom permite controlar **Color**, **Reflexión**, **Brillo**, **Textura superficial**, intensidad y tamaño de textura.
+- Los presets se generan localmente, se aplican a la textura UV y se conservan al exportar GLB.
 - Descarga de la textura resultante como PNG.
 
 ### Imagen 2D → objeto 3D
@@ -50,15 +57,17 @@ La aplicación reúne creación de primitivas, transformaciones, pinceles de esc
 - Suavizado de máscara y contornos.
 - Simplificación poligonal para reducir puntos innecesarios.
 - Vista previa de la imagen original, la silueta y el vector.
-- Generación y descarga de SVG.
+- Generación y descarga de SVG dentro del Worker, con límites de complejidad para evitar contornos patológicos que bloqueen la interfaz.
+- Clasificación jerárquica de contornos para conservar agujeros, islas y anidamientos complejos durante la extrusión.
 - Extrusión con ancho, alto, profundidad y bisel configurables.
 - El objeto resultante puede moverse, esculpirse, pintarse y exportarse como cualquier otra pieza.
 
 ### Exportación y persistencia
 
 - Exportación de escena en GLB y OBJ.
-- Exportación de un objeto seleccionado o de toda la escena en STL.
+- Exportación de un objeto seleccionado o de los **objetos visibles** de la escena en STL.
 - STL binario o ASCII.
+- Comprobación básica de STL en coordenadas transformadas: detecta bordes abiertos, aristas no-manifold y triángulos degenerados y advierte antes de exportar. No sustituye una validación completa de autointersecciones o grosor mínimo.
 - Guardado local del proyecto mediante IndexedDB.
 - Historial de deshacer y rehacer con presupuesto de memoria.
 
@@ -84,13 +93,15 @@ sculptcad-pro/
 └── tests/                     # Validación estática y pruebas smoke
 ```
 
-Las operaciones pesadas de malla se ejecutan fuera del hilo principal mediante un **Web Worker**. Los trazos de escultura y pintura se agrupan por `requestAnimationFrame` para reducir trabajo redundante.
+Las operaciones pesadas de malla se ejecutan fuera del hilo principal mediante un **Web Worker**. La vectorización 2D→3D usa un Worker independiente, y los cambios de sus sliders se agrupan con debounce para evitar bloquear la interfaz. Los trazos de escultura y pintura se agrupan por `requestAnimationFrame` para reducir trabajo redundante. El spatial hash incluye un fallback lineal cuando una escala muy anisotrópica haría demasiado costoso recorrer celdas.
 
 ## Requisitos
 
 - Navegador moderno con WebGL y soporte para módulos ES.
 - Chrome, Edge o Firefox recientes.
 - Conexión a internet para cargar Three.js `0.164.1` desde jsDelivr.
+
+Si las dependencias externas no cargan, la pantalla de inicio muestra un error en lugar de permanecer indefinidamente en estado de carga. La aplicación también limita el tamaño y complejidad de entradas para reducir bloqueos por modelos o imágenes extremos. El límite de modelos es **64 MB por defecto** y puede ajustarse desde la interfaz hasta un máximo de **100 MB**; la preferencia queda guardada en el navegador. Las texturas están limitadas a 20 MB y las imágenes decodificadas a un máximo de 40 millones de píxeles. La importación limita además la cantidad total de vértices.
 
 No necesita Node.js, npm, PHP, base de datos ni servidor de aplicación para su uso normal.
 
@@ -124,6 +135,8 @@ También puede usarse una extensión como **Live Server** en Visual Studio Code.
 El proyecto no requiere compilación ni backend. Para publicarlo, copia el contenido de la carpeta en la raíz pública de cualquier servicio de alojamiento estático. El archivo `index.html` debe permanecer en el nivel principal.
 
 Las rutas de los recursos son relativas, por lo que la aplicación puede funcionar tanto en la raíz de un dominio como dentro de un subdirectorio.
+
+En pantallas móviles, las acciones **Nueva escena**, **Importar**, **Guardar copia** y **Recuperar copia** se agrupan en el menú `⋯` de la barra superior.
 
 ## Flujo de uso recomendado
 
@@ -168,7 +181,7 @@ Para convertir una imagen en volumen:
 
 | Operación | Formatos |
 |---|---|
-| Importar modelos | OBJ, STL, GLTF, GLB |
+| Importar modelos | OBJ, STL, GLB, glTF autocontenido |
 | Cargar imágenes 2D | PNG, JPG/JPEG, WEBP, BMP, GIF |
 | Exportar modelos | GLB, OBJ, STL |
 | Exportar vector | SVG |
@@ -189,6 +202,7 @@ Desde la raíz del proyecto:
 python tests/validate_project.py
 node tests/sculpt_tools_smoke.mjs
 node tests/mesh_worker_smoke.cjs
+node tests/vector_worker_smoke.cjs
 ```
 
 Las pruebas verifican:
@@ -198,12 +212,18 @@ Las pruebas verifican:
 - Sintaxis de todos los módulos JavaScript.
 - Comportamiento básico de Suavizar y Crease.
 - Subdivisión, reducción y relajación en el Web Worker.
+- Continuidad de vértices coincidentes al relajar mallas no indexadas.
+- Separación de láminas próximas para evitar soldaduras accidentales.
+- Vectorización básica dentro de su Web Worker.
+- Rechazo de casos patológicos con demasiados contornos/puntos.
 
 ## Limitaciones actuales
 
-- Three.js se carga desde CDN; para trabajar completamente offline debe alojarse localmente.
-- La vectorización está optimizada para siluetas, logotipos e imágenes de alto contraste, no para fotografías complejas.
+- Three.js se carga desde una versión exacta fijada en CDN; para trabajar completamente offline o eliminar esa dependencia de red debe alojarse localmente.
+- La vectorización está optimizada para siluetas, logotipos e imágenes de alto contraste, no para fotografías complejas. Imágenes con cantidades extremas de contornos se rechazan y requieren limpieza/simplificación.
+- **Subdividir + relajar** no es un remesher isotrópico completo con edge flips/colapsos; aumenta detalle y regulariza la malla existente.
 - La reducción de malla usa agrupamiento espacial y no un simplificador QEM completo.
+- Un glTF con `.bin` o texturas externas no se importa como conjunto de archivos; usa GLB o glTF autocontenido.
 - Las operaciones booleanas, capas de pintura y agrupación jerárquica todavía no están incluidas.
 - El guardado local depende del navegador y puede perderse si se borran los datos del sitio.
 

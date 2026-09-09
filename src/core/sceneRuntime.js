@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
 export function createSceneRuntime({
   canvas,
@@ -15,13 +16,21 @@ export function createSceneRuntime({
   const camera = new THREE.PerspectiveCamera(45, 1, 0.02, 200);
   camera.position.set(3.9, 3.1, 4.8);
 
-  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: false });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.18;
+
+  // Entorno de estudio neutro: mejora reflejos metálicos (chrome/gold) sin
+  // cambiar el fondo oscuro de la aplicación. Se genera localmente con PMREM.
+  const environment = new RoomEnvironment();
+  const pmremGenerator = new THREE.PMREMGenerator(renderer);
+  scene.environment = pmremGenerator.fromScene(environment, 0.04).texture;
+  environment.dispose();
+  pmremGenerator.dispose();
 
   const orbit = new OrbitControls(camera, canvas);
   orbit.enableDamping = true;

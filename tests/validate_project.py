@@ -10,7 +10,10 @@ duplicates = sorted({item for item in ids if ids.count(item) > 1})
 
 dom = (ROOT / 'src/core/dom.js').read_text(encoding='utf-8')
 refs = re.findall(r"\$\('([^']+)'\)", dom)
-missing_refs = sorted(set(refs) - set(ids))
+listener_refs = re.findall(r"\bon\('([^']+)'", (ROOT / 'src/main.js').read_text(encoding='utf-8'))
+direct_refs = re.findall(r"getElementById\(['\"]([^'\"]+)['\"]\)", (ROOT / 'src/main.js').read_text(encoding='utf-8'))
+all_runtime_refs = refs + listener_refs + direct_refs
+missing_refs = sorted(set(all_runtime_refs) - set(ids))
 
 missing_imports = []
 js_files = sorted((ROOT / 'src').rglob('*.js'))
@@ -30,7 +33,7 @@ for source in js_files:
         syntax_errors.append((str(source.relative_to(ROOT)), result.stderr.strip()))
 
 print(f'HTML ids: {len(ids)} ({len(set(ids))} únicos)')
-print(f'Referencias DOM: {len(refs)}')
+print(f'Referencias DOM/runtime: {len(all_runtime_refs)}')
 print(f'Módulos JS: {len(js_files)}')
 
 if duplicates or missing_refs or missing_imports or syntax_errors:

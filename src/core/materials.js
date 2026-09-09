@@ -29,13 +29,15 @@ export function makeTextureCanvas(color = '#e6c5b5', size = 1024) {
 }
 
 export function createMaterial(textureSet) {
-  const roughness = parseFloat(materialUI?.roughness?.value ?? 0.72);
+  const shine = parseFloat(materialUI?.roughness?.value ?? 0.38);
+  const roughness = 1 - THREE.MathUtils.clamp(shine, 0, 1);
   const metalness = parseFloat(materialUI?.metalness?.value ?? 0.04);
   return new THREE.MeshStandardMaterial({
     color: 0xffffff,
     map: textureSet.texture,
     roughness,
     metalness,
+    envMapIntensity: 1.25,
     vertexColors: true,
     flatShading: false,
     side: THREE.DoubleSide
